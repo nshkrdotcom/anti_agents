@@ -117,7 +117,6 @@ defmodule AntiAgents.Trace do
       "reachable_baseline_count" => length(report.reachable_archive),
       "rejected_duplicate_or_reachable_count" => rejected_count,
       "mapping_trace_count" => length(report.mapping_traces),
-      "delta_frontier" => report.delta_frontier,
       "frontier_cell_count" => report.frontier_cell_count,
       "reachable_cell_count" => report.reachable_cell_count,
       "novel_frontier_cell_count" => report.novel_frontier_cell_count,

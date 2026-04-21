@@ -504,7 +504,6 @@ defmodule AntiAgentsTest do
       report = AntiAgents.frontier(field, opts)
       assert %FrontierReport{} = report
       assert report.field == field
-      assert is_float(report.delta_frontier)
       assert is_list(report.exemplars)
       assert is_list(report.reachable_archive)
       assert is_list(report.mapping_traces)
@@ -531,7 +530,7 @@ defmodule AntiAgentsTest do
       assert compare.field == field
       assert is_list(compare.reachable_archive)
       assert is_list(compare.frontier_archive)
-      assert is_number(compare.delta_frontier)
+      assert is_integer(compare.novel_frontier_cell_count)
     end
 
     test "descriptor cells do not treat seed coverage as frontier novelty" do
@@ -589,7 +588,6 @@ defmodule AntiAgentsTest do
       assert report.reachable_cell_count == 1
       assert report.frontier_cell_count == 1
       assert report.novel_frontier_cell_count == 1
-      assert report.delta_frontier == 1.0
       assert length(report.exemplars) == 1
       assert length(report.rejected_duplicates) == 1
       assert hd(report.rejected_duplicates).rejection_reason =~ "reachable"
@@ -1306,7 +1304,7 @@ defmodule AntiAgentsTest do
               Progress.event(opts, :frontier_report_done, %{
                 accepted: 0,
                 rejected: 1,
-                delta_frontier: 0.0,
+                novel_frontier_cell_count: 0,
                 archive_coverage: 0.0,
                 seed_coverage: 0.0
               })
@@ -1356,7 +1354,6 @@ defmodule AntiAgentsTest do
         field: field,
         exemplars: [burst],
         reachable_archive: [burst],
-        delta_frontier: 1.0,
         frontier_cell_count: 1,
         reachable_cell_count: 1,
         novel_frontier_cell_count: 1,

@@ -295,7 +295,7 @@ defmodule AntiAgents.Progress do
   end
 
   defp message(:frontier_report_done, metadata, _snapshot, _opts) do
-    "Stage 3/3 report complete | accepted=#{metadata[:accepted]} | rejected=#{metadata[:rejected]} | delta_frontier=#{metadata[:delta_frontier]} | archive_coverage=#{metadata[:archive_coverage]} | mean_seed_coverage=#{metadata[:seed_coverage]}"
+    "Stage 3/3 report complete | accepted=#{metadata[:accepted]} | rejected=#{metadata[:rejected]} | novel_frontier_cells=#{metadata[:novel_frontier_cell_count]} | archive_coverage=#{metadata[:archive_coverage]} | mean_seed_coverage=#{metadata[:seed_coverage]}"
   end
 
   defp message(:trace_written, metadata, _snapshot, _opts) do

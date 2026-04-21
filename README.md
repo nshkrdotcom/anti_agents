@@ -123,15 +123,13 @@ The current harness has a concrete, falsifiable hypothesis:
 > bursts should produce at least one descriptor cell not occupied by the reachable
 > baseline archive, while preserving mean verified seed coverage above `0.5`.
 
-The main reported statistic is `novel_frontier_cell_count`; `delta_frontier` is
-kept as a compatibility alias:
+The main reported statistic is `novel_frontier_cell_count`:
 
 ```text
 reachable_cells = unique_descriptor_cells(accepted_baselines)
 frontier_cells = unique_descriptor_cells(accepted_frontier)
 
 novel_frontier_cell_count = |frontier_cells \ reachable_cells|
-delta_frontier = novel_frontier_cell_count
 ```
 
 A positive value is not, by itself, a paper-level result. It is a live-run signal
@@ -178,7 +176,6 @@ cell was already reachable.
   "reachable_cell_count": 4,
   "frontier_cell_count": 2,
   "novel_frontier_cell_count": 2,
-  "delta_frontier": 2.0,
   "mean_seed_coverage": 0.9714,
   "coverage_delta": 0.971,
   "invalid_mapping_count": 0,
@@ -342,7 +339,6 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
   rejected_duplicates: [%AntiAgents.BurstResult{}, ...],  # duplicate/reachable/rejected burst attempts
   reachable_hits:      [%{descriptor: ..., reason: :reachable, score: ...}, ...],
   mapping_traces:      [%{"decisions" => [...]}, ...],     # audit trail for all frontier attempts
-  delta_frontier:      2.0,                                # compatibility alias for novel_frontier_cell_count
   frontier_cell_count: 2,
   reachable_cell_count: 4,
   novel_frontier_cell_count: 2,
@@ -418,8 +414,8 @@ heartbeats with in-flight work, and truncated input/output previews. Use
 
 The `--out` path receives a structured JSON trace (`AntiAgents.Trace`) that includes
 the synthesis claim under test, run parameters, evidence summary (`meaningful_signal`,
-`novel_frontier_cell_count`, `delta_frontier`, `mean_seed_coverage`), the clean
-`reachable_archive`, and per-exemplar mapping audit trails.
+`novel_frontier_cell_count`, `mean_seed_coverage`), the clean `reachable_archive`,
+and per-exemplar mapping audit trails.
 
 ## Anti-collapse policy
 

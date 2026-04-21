@@ -167,7 +167,6 @@ defmodule AntiAgents.FrontierReport do
     :field,
     exemplars: [],
     reachable_archive: [],
-    delta_frontier: 0.0,
     frontier_cell_count: 0,
     reachable_cell_count: 0,
     novel_frontier_cell_count: 0,
@@ -185,7 +184,6 @@ defmodule AntiAgents.FrontierReport do
           field: AntiAgents.Field.t(),
           exemplars: [AntiAgents.BurstResult.t()],
           reachable_archive: [AntiAgents.BurstResult.t()],
-          delta_frontier: float(),
           frontier_cell_count: non_neg_integer(),
           reachable_cell_count: non_neg_integer(),
           novel_frontier_cell_count: non_neg_integer(),
@@ -1205,9 +1203,7 @@ defmodule AntiAgents.Scoring do
     ~w(
       answer
       anti_collapse
-      delta_frontier
       exemplars
-      frontier_delta
       mapping
       mapping_trace
       mapping_traces
@@ -1674,7 +1670,7 @@ defmodule AntiAgents.Frontier do
           field: Field.t(),
           reachable_archive: [BurstResult.t()],
           frontier_archive: [BurstResult.t()],
-          delta_frontier: float(),
+          novel_frontier_cell_count: non_neg_integer(),
           reachable_hits: [map()],
           duplicates: [BurstResult.t()]
         }
@@ -1728,7 +1724,7 @@ defmodule AntiAgents.Frontier do
       field: field,
       reachable_archive: reachable,
       frontier_archive: frontier_bursts,
-      delta_frontier: delta_cell_count(frontier_bursts, reachable),
+      novel_frontier_cell_count: novel_cell_count(frontier_bursts, reachable),
       reachable_hits: reachable_intersections(frontier_bursts, reachable),
       duplicates: duplicates(frontier_bursts)
     }
@@ -1760,7 +1756,6 @@ defmodule AntiAgents.Frontier do
       field: field,
       exemplars: accepted,
       reachable_archive: report.reachable_archive,
-      delta_frontier: Float.round(novel_frontier_cell_count * 1.0, 3),
       frontier_cell_count: frontier_cell_count,
       reachable_cell_count: reachable_cell_count,
       novel_frontier_cell_count: novel_frontier_cell_count,
@@ -1783,7 +1778,7 @@ defmodule AntiAgents.Frontier do
     Progress.event(opts, :frontier_report_done, %{
       accepted: length(frontier_report.exemplars),
       rejected: length(frontier_report.rejected_duplicates),
-      delta_frontier: frontier_report.delta_frontier,
+      novel_frontier_cell_count: frontier_report.novel_frontier_cell_count,
       archive_coverage: frontier_report.metrics.archive_coverage,
       seed_coverage: frontier_report.metrics.seed_coverage
     })
@@ -2020,7 +2015,7 @@ defmodule AntiAgents.Frontier do
     end)
   end
 
-  defp delta_cell_count(frontier, reachable) do
+  defp novel_cell_count(frontier, reachable) do
     frontier_cells =
       frontier
       |> Enum.filter(&(&1.status == :accepted and has_descriptor?(&1)))
