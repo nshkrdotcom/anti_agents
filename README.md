@@ -109,6 +109,7 @@ which argues for first generating random string entropy and then extracting a
 final answer from that entropy stream:
 
 - Misaki, Kou and Akiba, Takuya. *String Seed of Thought: Prompting LLMs for Distribution-Faithful and Diverse Generation.* arXiv:2510.21150. https://arxiv.org/abs/2510.21150
+- The conceptual foundation for the "Anti Agents SDK" was originally proposed by [@threepointone](https://x.com/threepointone/status/2046373376990605423) on X: *"I kinda want to build the anti agents sdk. no entities, high temperature, explicitly as a latent space exploration tool. optimised for weirdness."* (April 20, 2026).
 
 ## Reference
 
