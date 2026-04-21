@@ -13,9 +13,12 @@
   </a>
 </p>
 
-An Elixir prototype for entropy-first latent space exploration with LLMs. No agent
-abstractions — only primitives for injecting structured randomness into generation,
-fanning out parallel bursts, and measuring novelty against a reachable baseline archive.
+An Elixir research prototype for entropy-first exploration of the reachable output
+manifold of large language models. The package exposes no agent, planner, or
+conversational-memory abstractions; it provides only primitives for injecting
+structured randomness into generation, fanning out parallel bursts under the
+BEAM concurrency model, and measuring novelty against a reachable baseline
+archive.
 
 ## Contents
 
@@ -25,7 +28,7 @@ fanning out parallel bursts, and measuring novelty against a reachable baseline 
 - [Live result](#live-result)
 - [Mechanism](#mechanism)
 - [Experimental trace](#experimental-trace)
-- [Install](#install)
+- [Installation](#installation)
 - [API](#api)
 - [Output schema](#output-schema)
 - [Scoring](#scoring)
@@ -39,91 +42,104 @@ fanning out parallel bursts, and measuring novelty against a reachable baseline 
 
 ## Research context
 
-This repository is a research prototype built from the Diversity-Aware Generation
-(DAG) side of Misaki and Akiba's String Seed of Thought (SSoT) paper.[^1] The paper
-studies two related failure modes of modern language models:
+This repository is a research prototype derived from the Diversity-Aware
+Generation (DAG) component of Misaki and Akiba's *String Seed of Thought*
+(SSoT) paper.[^1] That work characterises two related failure modes of
+contemporary language models:
 
-- **Probabilistic Instruction Following (PIF)**: the model should sample from a
-  target distribution, but naive prompting often produces biased empirical
-  frequencies.
-- **Diversity-Aware Generation (DAG)**: the model should produce many valid,
-  diverse responses without collapsing to familiar modes or losing quality.
+- **Probabilistic Instruction Following (PIF)** — the model is required to
+  sample from a specified target distribution, yet naive prompting yields
+  systematically biased empirical frequencies.
+- **Diversity-Aware Generation (DAG)** — the model is required to produce
+  many valid, diverse responses without collapsing to familiar modes or
+  sacrificing utility.
 
-SSoT addresses both by moving randomness into an explicit, inspectable
-intermediate object. Instead of asking the model to "be random" directly, the
-prompt asks the model to generate a random string and then manipulate that string
-to select an action or construct a response. For DAG, the relevant instruction is
-the paper's "generate a random string, and manipulate it to generate one diverse
-response" form.
+SSoT addresses both regimes by externalising randomness into an explicit,
+inspectable intermediate object. Rather than instructing the model to "be
+random" directly, the prompt directs the model to generate a random string and
+subsequently to manipulate that string in order to select an action or to
+construct a response. For DAG, the relevant instruction is the paper's
+"generate a random string, and manipulate it to generate one diverse response"
+formulation.
 
-The paper reports three observations this package treats as engineering
-constraints:
+The paper reports three empirical observations that this package adopts as
+engineering constraints:
 
 - SSoT improves open-ended diversity on NoveltyBench relative to plain
-  baselines, paraphrase prompts, and temperature increases, while preserving
-  utility.
-- Each generation is independent, so SSoT is naturally batchable and parallel.
-- The model's use of the string matters: strong runs use strategies such as
-  rolling hashes, chunk-local decisions, and template filling; weak runs collapse
-  to prefix-only or single-global-choice use.
+  baselines, paraphrase prompts, and temperature increases, without degrading
+  task utility.
+- Each generation is independent, so the method is naturally batchable and
+  admits straightforward parallel execution.
+- The model's use of the generated string is decisive: strong runs exhibit
+  strategies such as rolling hashes, chunk-local decisions, and template
+  filling, whereas weak runs collapse to prefix-only or single-global-choice
+  behaviour.
 
-`anti_agents` is an executable harness for studying that mechanism in live Codex
-runs. It does not claim to reproduce the paper's NoveltyBench numbers. It asks a
-narrower systems question: can SSoT-style coordinate generation, plus explicit
-archive pressure, discover outputs outside what clean baseline prompting reaches
-under an equal-budget live run?
+`anti_agents` is an executable harness for studying that mechanism in live
+Codex runs. It does not aim to reproduce the paper's NoveltyBench results. It
+instead addresses a narrower systems-level question: under an equal-budget
+live run, does SSoT-style coordinate generation combined with explicit archive
+pressure discover outputs lying outside the region reachable by clean baseline
+prompting?
 
 ## From SSoT to AntiAgents
 
-The SSoT paper's core protocol is simple:
+The core SSoT protocol comprises three steps:
 
 1. Generate an internal random string.
 2. Manipulate that string through an explicit mapping strategy.
-3. Produce the final action or answer from that mapping.
+3. Derive the final action or answer from that mapping.
 
-For open-ended generation, the paper's CoT analysis shows that useful diversity
-often comes from decomposing the response into local creative choices. In the
-fable example, chunks of the seed are assigned to setting, trait, conflict, and
-moral. In the broader NoveltyBench analysis, creative tasks benefit when the
-model constructs a template and samples local elements from the random string
-rather than making one global theme choice.
+For open-ended generation, the paper's chain-of-thought analysis establishes
+that useful diversity typically arises when the response is decomposed into
+local creative choices. In the fable example, chunks of the seed are assigned
+to setting, trait, conflict, and moral; more broadly, NoveltyBench performance
+improves when the model constructs a template and samples local elements from
+the random string rather than committing to a single global theme.
 
-`anti_agents` turns that observation into a frontier engine:
+`anti_agents` operationalises this observation as a frontier-search engine
+organised around the following value objects:
 
-- A **field** is the conceptual region to explore.
-- A **burst** is one SSoT-conditioned generation from that field.
+- A **field** is the conceptual region to be explored.
+- A **burst** is a single SSoT-conditioned generation drawn from that field.
 - A **branch** is a parallel fanout of bursts.
-- A **reachable archive** is built from ordinary baselines: plain prompting,
-  paraphrase prompting, seed injection, and temperature sweeps.
-- A **frontier archive** contains burst outputs that survive anti-collapse checks
-  and do not land in cells already occupied by the reachable archive.
+- A **reachable archive** is constructed from standard baselines: plain
+  prompting, paraphrase prompting, seed injection, and temperature sweeps.
+- A **frontier archive** contains burst outputs that pass anti-collapse checks
+  and occupy descriptor cells not already occupied by the reachable archive.
 
-This is deliberately not an agent framework. It has no personas, tools, task
-planner, autonomous loop, or conversation memory. The experimental object is not
-"the best answer"; it is the set of outputs that occupy descriptor cells the
-baseline archive did not occupy.
+The library is deliberately not an agent framework. It defines no personas,
+tools, task planner, autonomous loop, or conversational memory. The
+experimental object of interest is not "the best answer" but the subset of
+outputs occupying descriptor cells inaccessible to the baseline archive.
 
 ## Research questions
 
-The live command is intended to make the following questions testable:
+The live-run command is designed to make the following questions empirically
+testable:
 
-1. **Counterfactual novelty**: Given the same field and budget, do SSoT bursts
-   occupy archive cells not reached by plain, paraphrase, or temperature baselines?
-2. **Seed utilization**: Do accepted bursts use several chunks of the generated
-   random string, or do they collapse to prefix-only / single-choice behavior?
-3. **Trace honesty**: Can we inspect enough of the model's random string,
-   mapping, baseline archive, accepted frontier, and rejection reasons to audit
-   whether a positive result is real?
-4. **Operational scalability**: Does the SSoT independence property translate
-   into practical parallel execution through BEAM tasks and the Codex SDK?
+1. **Counterfactual novelty.** Under a fixed field and equal budget, do SSoT
+   bursts occupy archive cells that are not reached by plain, paraphrase, or
+   temperature-swept baselines?
+2. **Seed utilisation.** Do accepted bursts genuinely exploit multiple chunks
+   of the generated random string, or do they collapse to prefix-only or
+   single-choice behaviour?
+3. **Trace auditability.** Is the run trace — comprising the model's random
+   string, its mapping, the baseline archive, the accepted frontier, and all
+   rejection reasons — sufficient to assess whether a positive result is
+   genuine?
+4. **Operational scalability.** Does the independence property established by
+   SSoT translate into practical parallel execution via BEAM tasks and the
+   Codex SDK?
 
-The current harness has a concrete, falsifiable hypothesis:
+The harness adopts a concrete and falsifiable hypothesis:
 
-> For a fixed field and equal attempted baseline/frontier budget, verified SSoT
-> bursts should produce at least one descriptor cell not occupied by the reachable
-> baseline archive, while preserving mean verified seed coverage above `0.5`.
+> For a fixed field and an equal attempted baseline/frontier budget, verified
+> SSoT bursts should produce at least one descriptor cell that is not occupied
+> by the reachable baseline archive, while maintaining mean verified seed
+> coverage above `0.5`.
 
-The main reported statistic is `novel_frontier_cell_count`:
+The principal reported statistic is `novel_frontier_cell_count`, defined as:
 
 ```text
 reachable_cells = unique_descriptor_cells(accepted_baselines)
@@ -132,17 +148,17 @@ frontier_cells = unique_descriptor_cells(accepted_frontier)
 novel_frontier_cell_count = |frontier_cells \ reachable_cells|
 ```
 
-A positive value is not, by itself, a paper-level result. It is a live-run signal
-that the current field, prompt contract, model, temperature, and archive
-descriptors produced frontier cells beyond the reachable baseline set. The
-current descriptor cell is deliberately simple: `{length, sentence_count, affect,
-abstraction}`. Verified seed usage is measured and scored, but it is not part of
-cell identity.
+A positive value does not by itself constitute a paper-level result. It is a
+live-run signal that the current field, prompt contract, model, temperature,
+and archive descriptors produced frontier cells beyond the reachable baseline
+set. The descriptor cell is deliberately coarse — `{length, sentence_count,
+affect, abstraction}` — and verified seed usage, although measured and scored,
+is intentionally excluded from cell identity.
 
 ## Live result
 
-The current hardening pass ran a small live Codex experiment with the following
-command:
+The most recent hardening pass executed a small live Codex experiment using
+the following command:
 
 ```bash
 mix anti_agents.frontier "the memory of a color that does not exist" \
@@ -160,11 +176,11 @@ mix anti_agents.frontier "the memory of a color that does not exist" \
   --out tmp/anti_agents_live_frontier_verified_final3.json
 ```
 
-The run attempted 6 baseline calls and 6 SSoT frontier bursts. Four baselines
-entered the reachable archive; two baseline responses were rejected as prompt
-artifacts. All six frontier bursts had valid host-verified mappings, five
-survived reachable-cell filtering, and one was rejected because its descriptor
-cell was already reachable.
+The run issued six baseline calls and six SSoT frontier bursts. Four
+baselines entered the reachable archive, while two baseline responses were
+discarded as prompt artefacts. All six frontier bursts produced mappings that
+passed host-side verification; five survived the reachable-cell filter, and
+one was rejected because its descriptor cell was already reachable.
 
 ```json
 {
@@ -195,78 +211,86 @@ A color without a spectrum, remembered as a pressure behind the eyes: shy, impos
 I remember the impossible color as a held distance: not a shade, but a location the eye revisits after language has failed. It arrives as a soft contradiction, like warmth without light, and closes by leaving the absence intact.
 ```
 
-Interpretation: this is useful evidence that the current SSoT contract can
-produce auditable, non-reachable cells in a live Codex run. It is also modest
-evidence. The field is narrow, the descriptor space is coarse, the default
-distance backend is lexical, and this is not a NoveltyBench reproduction. The
-result should be read as "the harness is experimentally usable and generated a
-positive pilot signal," not as "SSoT frontier search is proved."
+Interpretation. The outcome provides useful evidence that the present SSoT
+contract can produce auditable, non-reachable cells in a live Codex run. The
+evidence is, however, modest in scope: the field is narrow, the descriptor
+space is coarse, the default distance backend is lexical, and the experiment
+is not a NoveltyBench reproduction. The result should be read as demonstrating
+that the harness is experimentally usable and has generated a positive pilot
+signal, rather than as establishing frontier search under SSoT.
 
 ## Mechanism
 
-Each **burst** follows the SSoT protocol:
+Each **burst** conforms to the following SSoT protocol:
 
-1. A coordinate nonce is sampled host-side for run identity and traceability.
+1. A coordinate nonce is sampled host-side to provide run identity and
+   traceability.
 2. The model is instructed to internally generate its own random string.
 3. The model returns a structured object with three fields:
-   - `random_string` — the model-generated entropy string, not the host nonce
-   - `mapping` — per-chunk decisions across exploration axes (`ontology`, `metaphor`, `syntax`, `affect`, `contradiction`, `closure`)
-   - `answer` — the final generated text
-4. Each mapping decision must include `axis`, `chunk`, `hash`, `choice`, and
+   - `random_string` — the model-generated entropy string, distinct from the host nonce;
+   - `mapping` — per-chunk decisions across the exploration axes (`ontology`, `metaphor`, `syntax`, `affect`, `contradiction`, `closure`);
+   - `answer` — the final generated text.
+4. Each mapping decision must carry `axis`, `chunk`, `hash`, `choice`, and
    `value`. The host recomputes `hash = sum(bytes("#{chunk}:#{chunk_text}")) mod
-   997` from the emitted `random_string`. Invalid hashes or chunk indexes are
-   rejected.
-5. The verified mapping is audited for **anti-collapse**: responses that reference
-   only one chunk or cover fewer than `max(2, ⌈N/3⌉)` distinct chunks are rejected.
-6. Accepted bursts are scored against a **reachable baseline archive** built from
-   plain, paraphrase, seed-injection, and temperature-sweep completions of the same field.
-7. Bursts whose descriptor cell matches any baseline cell are filtered into the
-   reachable set; the remainder constitute the **frontier**.
+   997` from the emitted `random_string`; decisions with invalid hashes or
+   out-of-range chunk indices are rejected.
+5. The verified mapping is audited for **anti-collapse**: responses that
+   reference only a single chunk, or cover fewer than `max(2, ⌈N/3⌉)` distinct
+   chunks, are rejected.
+6. Accepted bursts are scored against a **reachable baseline archive**
+   constructed from plain, paraphrase, seed-injection, and temperature-sweep
+   completions of the same field.
+7. Bursts whose descriptor cell coincides with any baseline cell are routed
+   into the reachable set; the remainder constitute the **frontier**.
 
-Two details are intentionally stricter than a generic demo:
+Several design choices are intentionally more stringent than is typical in
+demonstration code:
 
-- Baseline calls use a clean non-SSoT contract. Except for the explicit
-  `seed_injection` baseline, they do not receive the coordinate nonce, SSoT
-  schema, or mapping instructions.
-- Artifact guards reject prompt echoes, nested control JSON, malformed
-  `random_string` / `mapping` payloads, code-fence output, and SDK/CLI tutorial
-  responses before they can enter the reachable or frontier archives.
-- Random-string guards reject nonce copying, very short strings, highly
-  repetitive strings, and duplicate model-generated random strings within one
-  frontier run.
+- Baseline calls operate under a clean, non-SSoT contract. With the exception
+  of the explicit `seed_injection` baseline, they are not supplied the
+  coordinate nonce, the SSoT schema, or any mapping instructions.
+- Artefact guards reject prompt echoes, nested control JSON, malformed
+  `random_string` or `mapping` payloads, code-fenced output, and SDK/CLI
+  tutorial responses before such content can enter either archive.
+- Random-string guards reject nonce copying, excessively short strings,
+  highly repetitive strings, and duplicate model-generated random strings
+  observed within a single frontier run.
 
 ## Experimental trace
 
-The CLI writes a JSON trace designed for research inspection, not just debugging.
-The trace includes:
+The CLI emits a JSON trace intended for research inspection rather than mere
+debugging. The trace contains:
 
-- `synthesis`: the claim under test and anti-collapse checks.
-- `run`: model, reasoning effort, temperature, branching, baseline methods, and
-  coordinate configuration.
-- `reachable_archive`: clean baseline responses and descriptors.
-- `exemplars`: accepted frontier bursts, mappings, descriptors, scores, and seed
-  coverage.
-- `rejected_duplicates`: bursts rejected as reachable, duplicates, low coverage,
-  or artifacts.
-- `mapping_traces`: the full random-string-to-axis decision traces.
-- `evidence`: summarized fields such as `meaningful_signal`,
+- `synthesis` — the claim under test together with the configured
+  anti-collapse checks;
+- `run` — model, reasoning effort, temperature, branching, baseline methods,
+  and coordinate configuration;
+- `reachable_archive` — clean baseline responses and their descriptors;
+- `exemplars` — accepted frontier bursts with mappings, descriptors, scores,
+  and seed-coverage values;
+- `rejected_duplicates` — bursts rejected as reachable, duplicate, low in
+  coverage, or artefactual;
+- `mapping_traces` — the complete random-string-to-axis decision traces;
+- `evidence` — summary fields including `meaningful_signal`,
   `reachable_baseline_count`, `accepted_frontier_count`,
   `novel_frontier_cell_count`, `coverage_delta`, `invalid_mapping_count`, and
   `mean_seed_coverage`.
 
-With `--verbose`, the command also emits a human-readable run log:
+Invoking the command with `--verbose` additionally emits a human-readable run
+log that reports:
 
-- total LLM calls before the run starts,
-- stage purpose for baseline and frontier phases,
-- `LLM n/total` progress,
-- in-flight heartbeat summaries,
-- truncated input/output previews.
+- the total number of LLM calls planned before the run begins;
+- the stage purpose of each baseline and frontier phase;
+- `LLM n/total` progress;
+- in-flight heartbeat summaries;
+- truncated input and output previews.
 
-This logging is part of the research surface. It exists so a user can catch
-experimental contamination, such as a baseline returning a CLI snippet or a burst
-returning nested JSON as an answer, while the run is still interpretable.
+This logging forms part of the research surface. It is provided so that
+experimental contamination — for example, a baseline that returns a CLI
+snippet or a burst that returns nested JSON in place of an answer — can be
+detected while the run is still interpretable.
 
-## Install
+## Installation
 
 Requires Elixir `~> 1.18` and a configured `codex_sdk ~> 0.16` environment.
 
@@ -290,19 +314,19 @@ field = AntiAgents.field("the memory of a color that doesn't exist",
   away_from: ["standard sci-fi"]
 )
 
-# Single burst — one entropy-injected generation
+# Single burst: one entropy-injected generation
 burst = AntiAgents.burst(field, heat: [answer: 1.05])
 
-# Parallel fanout — n bursts from independent seeds
+# Parallel fanout: n bursts from independent seeds
 bursts = AntiAgents.branch(field, 12, heat: [answer: 1.05])
 
-# Full frontier run — fanout + baseline archive + novelty filtering + scoring
+# Complete frontier run: fanout, baseline archive, novelty filtering, and scoring
 report = AntiAgents.frontier(field,
   branching: 12,
   baseline: [:plain, :paraphrase, {:temperature, [0.8, 1.0, 1.2]}, :seed_injection]
 )
 
-# Comparison only — returns raw archives without exemplar scoring
+# Comparison only: returns raw archives without exemplar scoring
 comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraphrase])
 ```
 
@@ -372,7 +396,7 @@ Each `%AntiAgents.BurstResult{}` carries:
 
 ## Scoring
 
-The composite score weights novelty over coherence:
+The composite score weights novelty more heavily than coherence:
 
 ```
 overall = 0.50 × baseline_distance
@@ -381,13 +405,15 @@ overall = 0.50 × baseline_distance
         + 0.10 × coherence
 ```
 
-`baseline_distance` and `frontier_distance` are `1 − max_jaccard_similarity`
-against the respective archive. Near-duplicate detection threshold: 0.91 Jaccard.
+`baseline_distance` and `frontier_distance` are computed as
+`1 − max_jaccard_similarity` against the reachable and frontier archives
+respectively. Near-duplicate detection uses a Jaccard threshold of `0.91`.
 
-Descriptor cells are 4-dimensional buckets `{length, sentence_count, affect,
-abstraction}` used for archive membership testing. Seed coverage is not included
-in the cell. This is important: otherwise SSoT outputs can look novel merely
-because baselines have no mapping trace.
+Descriptor cells are four-dimensional buckets
+`{length, sentence_count, affect, abstraction}` used for archive-membership
+testing. Seed coverage is deliberately excluded from cell identity;
+including it would allow SSoT outputs to appear novel merely because
+baselines carry no mapping trace.
 
 ## CLI
 
@@ -406,97 +432,104 @@ mix anti_agents.frontier "the memory of a color that doesn't exist" \
   --out trace.json
 ```
 
-Add `--dry-run` to print the resolved run configuration without calling the model.
-Use `--verbose` for human-readable progress: the command prints the total LLM call
-plan, the current stage, `LLM n/total`, why each baseline/frontier call exists,
-heartbeats with in-flight work, and truncated input/output previews. Use
-`--preview-chars N` to tune preview length.
+Passing `--dry-run` prints the resolved run configuration without invoking the
+model. The `--verbose` flag produces human-readable progress reporting: the
+total LLM-call plan, the current stage, `LLM n/total`, the purpose of each
+baseline or frontier call, heartbeats describing in-flight work, and truncated
+input/output previews. Preview length is controlled by `--preview-chars N`.
 
-The `--out` path receives a structured JSON trace (`AntiAgents.Trace`) that includes
-the synthesis claim under test, run parameters, evidence summary (`meaningful_signal`,
-`novel_frontier_cell_count`, `mean_seed_coverage`), the clean `reachable_archive`,
-and per-exemplar mapping audit trails.
+The `--out` path receives a structured JSON trace (`AntiAgents.Trace`)
+containing the synthesis claim under test, run parameters, the evidence
+summary (`meaningful_signal`, `novel_frontier_cell_count`,
+`mean_seed_coverage`), the clean `reachable_archive`, and the per-exemplar
+mapping audit trails.
 
 ## Anti-collapse policy
 
-Without explicit checks, SSoT-style prompts collapse: the model selects a single
-global theme from the first seed chunk and ignores the rest. `anti_agents` rejects
-any burst where:
+In the absence of explicit checks, SSoT-style prompts tend to collapse: the
+model selects a single global theme from the first seed chunk and ignores the
+remainder of the string. `anti_agents` therefore rejects any burst in which:
 
-- the emitted `random_string` is copied from the host coordinate nonce,
-- the emitted `random_string` is too short or highly repetitive,
-- the emitted `random_string` duplicates another frontier burst in the same run,
-- any decision references an invalid chunk or supplies a wrong hash,
-- only one distinct chunk index appears across all verified mapping decisions, or
+- the emitted `random_string` is a copy of the host coordinate nonce;
+- the emitted `random_string` is excessively short or highly repetitive;
+- the emitted `random_string` duplicates that of another frontier burst in the same run;
+- any decision references an invalid chunk or supplies an incorrect hash;
+- only one distinct chunk index appears across all verified mapping decisions; or
 - fewer than `max(2, ⌈chunk_count / 3⌉)` distinct chunks are verified.
 
-When the backend returns unstructured plain text from a burst call, the output is
-preserved in the trace as `:parse_error`; it is not promoted into a frontier
-exemplar with a synthetic mapping.
+When the backend returns unstructured plain text for a burst call, the output
+is retained in the trace with status `:parse_error`; it is never promoted into
+a frontier exemplar by means of a synthesised mapping.
 
 ## Limitations
 
-This package should be read as a live research harness, not as a completed
-benchmark implementation.
+The package should be regarded as a live research harness rather than a
+completed benchmark implementation.
 
-**Descriptor quality.** The current archive descriptors are deliberately simple:
-semantic fingerprint, structural buckets, affect band, abstraction level, and
-seed-usage profile. Archive cell identity currently uses only structural buckets,
-affect band, and text-derived abstraction level. These descriptors are sufficient
-for inspecting whether the pipeline works, but they are not a substitute for
-NoveltyBench's full evaluation protocol or a learned behavior descriptor.
+**Descriptor quality.** The current archive descriptors are deliberately
+simple: a semantic fingerprint, structural buckets, an affect band, an
+abstraction level, and a seed-usage profile. Cell identity is determined by
+structural buckets, affect band, and text-derived abstraction level alone.
+These descriptors suffice for verifying pipeline behaviour but do not
+substitute for NoveltyBench's full evaluation protocol or for a learned
+behaviour descriptor.
 
-**Distance quality.** The default similarity function uses lexical Jaccard
-distance. This is transparent and cheap, but it misses semantic equivalence and
-over-penalizes paraphrases. The intended next step is an embedding or
-LLM-as-judge distance backend.
+**Distance quality.** The default similarity function is a lexical Jaccard
+coefficient. This choice is transparent and inexpensive, but fails to capture
+semantic equivalence and over-penalises paraphrase. Planned work includes an
+embedding-based or LLM-as-judge distance backend.
 
-**Model dependence.** The paper emphasizes that SSoT depends on reasoning
-capability. Smaller or weaker models may fail to generate useful random strings,
-execute local mappings, or avoid prefix-only strategies. This package exposes
-`seed_coverage` and rejection reasons so those failures are visible.
+**Model dependence.** The SSoT paper emphasises that the method depends on
+reasoning capability. Smaller or weaker models may fail to generate useful
+random strings, execute local mappings, or avoid prefix-only strategies. The
+package exposes `seed_coverage` and rejection reasons so that such failures
+remain visible.
 
-**Prompt/schema fragility.** Live LLMs sometimes return prompt echoes, malformed
-nested JSON, or SDK/tutorial text. `anti_agents` rejects these artifacts, but the
-need for such guards is itself an experimental result: traceability is mandatory
-when studying diversity.
+**Prompt and schema fragility.** Live LLMs occasionally return prompt echoes,
+malformed nested JSON, or SDK or tutorial text. `anti_agents` rejects these
+artefacts, yet the necessity of such guards is itself an experimental finding:
+traceability is a prerequisite for studying diversity.
 
-**Semantic vs latent exploration.** The current implementation is an inference-time
-semantic exploration backend. It explores the model's reachable output manifold
-through controlled entropy and archive pressure. It does not yet implement true
-activation-space, LoRA, SVF, or weight-space steering.
+**Semantic versus latent exploration.** The present implementation is an
+inference-time semantic-exploration backend. It explores the model's
+reachable output manifold through controlled entropy and archive pressure; it
+does not yet implement activation-space, LoRA, SVF, or weight-space steering.
 
-**Single-answer tasks.** As in the SSoT paper, this method is intended for tasks
-with multiple acceptable outputs or probabilistic requirements. It is not meant
-for factual lookup, proof obligations, or tasks with one correct answer.
+**Single-answer tasks.** As with the original SSoT work, the method is
+intended for tasks admitting multiple acceptable outputs or probabilistic
+requirements. It is not intended for factual lookup, proof obligations, or
+tasks with a single correct answer.
 
 ## Paper crosswalk
 
-Key mappings from the paper to this package:
+The following table maps the principal concepts of the SSoT paper onto their
+realisation in this package:
 
-| Paper concept | Where it appears here |
-|---------------|------------------------|
-| PIF and DAG distinction | README frames `anti_agents` as a DAG/frontier harness, not a PIF sampler |
-| SSoT two-stage instruction | `AntiAgents.Prompt.burst_prompt/2` asks for `random_string`, `mapping`, and `answer` |
-| Full parallelizability | `AntiAgents.branch/3` and baseline archive construction use `Task.async_stream` |
-| NoveltyBench comparison against baseline, paraphrase, and temperature | `AntiAgents.frontier/2` builds a reachable archive from `:plain`, `:paraphrase`, `:seed_injection`, and `{:temperature, [...]}` |
-| DAG strategy: templates plus local random selection | `mapping.decisions` requires chunk-local axis decisions over ontology, metaphor, syntax, affect, contradiction, and closure, with host-verifiable `hash` and `choice` fields |
-| Simple SSoT prompt components | The prompt contract preserves explicit string generation, manipulation, and final answer extraction |
-| External randomness/tool-call limitations | Host nonces are used only for trace identity; the model must emit its own `random_string`; no model-visible tool calls are required |
-| Bias propagation from lazy prefix use | Anti-collapse rejects prefix-only mappings, low verified coverage, nonce copying, repetitive strings, and duplicate model random strings |
-| Reasoning-capability dependence | README and trace surface `reasoning_effort`, `thinking_budget`, `seed_coverage`, and rejection reasons |
+| Paper concept | Realisation in this package |
+|---------------|-----------------------------|
+| PIF/DAG distinction | The present README frames `anti_agents` as a DAG/frontier harness rather than a PIF sampler. |
+| SSoT two-stage instruction | `AntiAgents.Prompt.burst_prompt/2` requests `random_string`, `mapping`, and `answer`. |
+| Full parallelisability | `AntiAgents.branch/3` and baseline-archive construction are implemented with `Task.async_stream`. |
+| NoveltyBench comparison against baseline, paraphrase, and temperature | `AntiAgents.frontier/2` constructs a reachable archive from `:plain`, `:paraphrase`, `:seed_injection`, and `{:temperature, [...]}`. |
+| DAG strategy: template plus local random selection | `mapping.decisions` requires chunk-local axis decisions over ontology, metaphor, syntax, affect, contradiction, and closure, with host-verifiable `hash` and `choice` fields. |
+| Simple SSoT prompt components | The prompt contract preserves explicit string generation, manipulation, and final-answer extraction. |
+| External-randomness and tool-call limitations | Host nonces serve only as trace identifiers; the model must emit its own `random_string`, and no model-visible tool calls are required. |
+| Bias propagation from lazy prefix use | The anti-collapse policy rejects prefix-only mappings, low verified coverage, nonce copying, repetitive strings, and duplicate model-generated random strings. |
+| Reasoning-capability dependence | The README and trace surface `reasoning_effort`, `thinking_budget`, `seed_coverage`, and all rejection reasons. |
 
-The main extension beyond the paper is **counterfactual frontier accounting**:
-SSoT outputs are not treated as diverse merely because they differ from each
-other. They are compared against a clean reachable archive, and only cells not
-occupied by that archive count as frontier expansion.
+The principal extension beyond the paper is **counterfactual frontier
+accounting**: SSoT outputs are not considered diverse merely by virtue of
+differing from one another. They are compared against a clean reachable
+archive, and only cells that lie outside that archive are credited as
+frontier expansion.
 
 ## Credits
 
-The concept of an anti-agents SDK — no entities, high temperature, explicitly a
-latent space exploration tool, optimised for coverage over task completion — was
-proposed by [@threepointone](https://x.com/threepointone/status/2046373376990605423)
-on X (April 20, 2026).
+The concept of an anti-agents SDK — no entities, high temperature, an
+explicitly latent-space exploration tool optimised for coverage rather than
+task completion — was proposed by
+[@threepointone](https://x.com/threepointone/status/2046373376990605423) on X
+(20 April 2026).
 
 ## References
 
