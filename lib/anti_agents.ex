@@ -134,6 +134,7 @@ defmodule AntiAgents.BurstResult do
     :raw_output,
     :status,
     :rejection_reason,
+    mapping_verification: %{},
     score: %{},
     descriptor: %{},
     coherence: 0.0,
@@ -145,6 +146,7 @@ defmodule AntiAgents.BurstResult do
           seed: String.t(),
           random_string: String.t(),
           mapping_trace: map(),
+          mapping_verification: map(),
           answer: String.t(),
           raw_output: String.t(),
           status: :accepted | :rejected | :parse_error | :provider_error,
@@ -166,6 +168,13 @@ defmodule AntiAgents.FrontierReport do
     exemplars: [],
     reachable_archive: [],
     delta_frontier: 0.0,
+    frontier_cell_count: 0,
+    reachable_cell_count: 0,
+    novel_frontier_cell_count: 0,
+    coverage_delta: 0.0,
+    schema_rejected_count: 0,
+    invalid_mapping_count: 0,
+    duplicate_random_string_count: 0,
     reachable_hits: [],
     rejected_duplicates: [],
     mapping_traces: [],
@@ -177,6 +186,13 @@ defmodule AntiAgents.FrontierReport do
           exemplars: [AntiAgents.BurstResult.t()],
           reachable_archive: [AntiAgents.BurstResult.t()],
           delta_frontier: float(),
+          frontier_cell_count: non_neg_integer(),
+          reachable_cell_count: non_neg_integer(),
+          novel_frontier_cell_count: non_neg_integer(),
+          coverage_delta: float(),
+          schema_rejected_count: non_neg_integer(),
+          invalid_mapping_count: non_neg_integer(),
+          duplicate_random_string_count: non_neg_integer(),
           reachable_hits: [map()],
           rejected_duplicates: [AntiAgents.BurstResult.t()],
           mapping_traces: [map()],
@@ -405,12 +421,18 @@ defmodule AntiAgents.Prompt do
     You are not a persona. Produce exactly one exploration.
 
     1. Internally generate a fresh random string, then emit it as random_string.
-    2. Prefer a single JSON object with keys:
+    2. Return a single JSON object with keys:
        - random_string: the exact internally generated random string
        - mapping: an object with a decisions array
        - answer: the final answer text
-       The mapping.decisions entries should include chunk-local decisions across the axes.
+       Each mapping.decisions entry must include axis, chunk, hash, choice, and value.
        Split random_string into fixed-size chunks of #{chunk_size} and use these axes: #{axes}.
+       For each decision:
+       - chunk is a zero-based chunk index into random_string
+       - chunk_text is the selected chunk from random_string
+       - hash = sum of UTF-8 byte values in "<chunk>:<chunk_text>" modulo 997
+       - choice = hash modulo 7
+       - value explains how that local chunk affects the answer for the axis
     3. No markdown, no code fences, and no commentary outside the JSON object.
 
     Rules:
@@ -449,23 +471,23 @@ defmodule AntiAgents.Prompt do
     seed = get_seed(opts)
 
     plain_rule =
-      "\n\nReturn only the answer text. Do not explain, rewrite the prompt, mention AntiAgents, mention CLI/mix commands, use code fences, return JSON/XML, or include random_string/mapping."
+      "\n\nReturn only the generated answer text itself. Do not label the answer, explain, rewrite the prompt, offer a refined prompt, mention AntiAgents, mention CLI/mix commands, use code fences, return JSON/XML, or include random_string/mapping."
 
     case method do
       :plain ->
-        "#{base}Return a concise, high-coherence answer to the field.#{plain_rule}"
+        "#{base}Write a concise, high-coherence creative answer for the field.#{plain_rule}"
 
       :paraphrase ->
-        "#{base}Return a concise, faithful paraphrase of how you understand the field.#{plain_rule}"
+        "#{base}Write a concise, faithful answer that paraphrases the field's idea.#{plain_rule}"
 
       :seed_injection ->
-        "#{base}Use this seed internally to force a different but coherent framing: #{seed}. Do not print the seed.#{plain_rule}"
+        "#{base}Write a concise, coherent answer. Use this seed internally to force a different framing: #{seed}. Do not print the seed.#{plain_rule}"
 
       {:temperature, temps} when is_list(temps) ->
-        "#{base}Return a concise, coherent answer. Suggested temperature: #{inspect(temps)}.#{plain_rule}"
+        "#{base}Write a concise, coherent creative answer for the field.#{plain_rule}"
 
       _ ->
-        "#{base}Return a concise, coherent answer.#{plain_rule}"
+        "#{base}Write a concise, coherent creative answer for the field.#{plain_rule}"
     end
   end
 
@@ -591,9 +613,11 @@ defmodule AntiAgents.Prompt do
                 "properties" => %{
                   "axis" => %{"type" => "string"},
                   "chunk" => %{"type" => "integer"},
+                  "hash" => %{"type" => "integer"},
+                  "choice" => %{"type" => "integer"},
                   "value" => %{"type" => "string"}
                 },
-                "required" => ["axis", "chunk", "value"],
+                "required" => ["axis", "chunk", "hash", "choice", "value"],
                 "additionalProperties" => false
               }
             }
@@ -664,11 +688,11 @@ defmodule AntiAgents.Scoring do
     end
   end
 
-  def descriptor(text, mapping, seed, chunk_count) do
+  def descriptor(text, mapping, seed, chunk_count, verification \\ nil) do
     structural = structural_descriptor(text)
     affect = affect_band(text)
-    abstraction = abstraction_level(mapping, text)
-    seed_profile = seed_profile(mapping, seed, chunk_count)
+    abstraction = abstraction_level(text)
+    seed_profile = seed_profile(mapping, seed, chunk_count, verification)
 
     %{
       semantic: semantic_fingerprint(text),
@@ -688,6 +712,77 @@ defmodule AntiAgents.Scoring do
     |> Kernel./(denom)
     |> min(1.0)
     |> Float.round(3)
+  end
+
+  def local_hash(_axis, chunk_text, chunk_index) do
+    "#{chunk_index}:#{chunk_text}"
+    |> :binary.bin_to_list()
+    |> Enum.sum()
+    |> rem(997)
+  end
+
+  def verify_mapping(mapping, random_string, chunk_size) when is_map(mapping) do
+    decisions = Map.get(mapping, "decisions", Map.get(mapping, :decisions, []))
+    chunks = chunks(random_string, chunk_size)
+
+    {verified, invalid_reasons} =
+      decisions
+      |> List.wrap()
+      |> Enum.reduce({[], []}, fn decision, {verified, reasons} ->
+        case verify_decision(decision, chunks, chunk_size) do
+          {:ok, normalized} -> {[normalized | verified], reasons}
+          {:error, reason} -> {verified, [reason | reasons]}
+        end
+      end)
+
+    used_chunks =
+      verified
+      |> Enum.map(& &1["chunk"])
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    invalid_reasons =
+      invalid_reasons
+      |> maybe_add_missing_decisions(decisions)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    chunk_count = max(1, length(chunks))
+    coverage = Float.round(length(used_chunks) / chunk_count, 3)
+
+    %{
+      valid?: invalid_reasons == [],
+      coverage: coverage,
+      verified_chunk_count: length(used_chunks),
+      chunk_count: chunk_count,
+      used_chunks: used_chunks,
+      invalid_reasons: invalid_reasons,
+      decisions: Enum.reverse(verified)
+    }
+  end
+
+  def verify_mapping(_mapping, _random_string, chunk_size) do
+    chunk_count = max(1, chunk_count("", chunk_size))
+
+    %{
+      valid?: false,
+      coverage: 0.0,
+      verified_chunk_count: 0,
+      chunk_count: chunk_count,
+      used_chunks: [],
+      invalid_reasons: ["invalid_mapping"],
+      decisions: []
+    }
+  end
+
+  def verified_anti_collapse_fail?(verification) when is_map(verification) do
+    chunk_count = Map.get(verification, :chunk_count, 1)
+    used_count = Map.get(verification, :verified_chunk_count, 0)
+
+    prefix_only? = used_count == 1
+    poor_coverage? = used_count < minimum_verified_chunks(chunk_count)
+
+    prefix_only? or poor_coverage?
   end
 
   def score(candidate, reachable, frontier) do
@@ -779,7 +874,7 @@ defmodule AntiAgents.Scoring do
   def anti_collapse_fail?(mapping, chunk_count) do
     cov = parse_mapping_coverage(mapping)
     prefix_only? = cov.axis_count > 0 && cov.chunk_count == 1
-    poor_coverage? = cov.chunk_count < max(2, div(chunk_count, 3))
+    poor_coverage? = cov.chunk_count < minimum_verified_chunks(chunk_count)
     prefix_only? or poor_coverage?
   end
 
@@ -821,6 +916,92 @@ defmodule AntiAgents.Scoring do
     end)
     |> then(&%{"decisions" => &1})
   end
+
+  defp verify_decision(decision, chunks, _chunk_size) when is_map(decision) do
+    axis = decision_value(decision, "axis")
+    chunk = decision_value(decision, "chunk") |> integer_value()
+    supplied_hash = decision_value(decision, "hash") |> integer_value()
+
+    cond do
+      axis in [nil, ""] ->
+        {:error, "missing_axis"}
+
+      is_nil(chunk) ->
+        {:error, "invalid_chunk"}
+
+      chunk < 0 or chunk >= length(chunks) ->
+        {:error, "invalid_chunk"}
+
+      is_nil(supplied_hash) ->
+        {:error, "missing_hash"}
+
+      true ->
+        chunk_text = Enum.at(chunks, chunk)
+        expected_hash = local_hash(axis, chunk_text, chunk)
+
+        if supplied_hash == expected_hash do
+          {:ok,
+           %{
+             "axis" => to_string(axis),
+             "chunk" => chunk,
+             "hash" => supplied_hash,
+             "choice" => integer_value(decision_value(decision, "choice")),
+             "value" => to_string(decision_value(decision, "value") || ""),
+             "chunk_text" => chunk_text
+           }}
+        else
+          {:error, "invalid_hash"}
+        end
+    end
+  end
+
+  defp verify_decision(_decision, _chunks, _chunk_size), do: {:error, "invalid_decision"}
+
+  defp decision_value(decision, key) do
+    Map.get(decision, key, Map.get(decision, String.to_atom(key)))
+  end
+
+  defp integer_value(value) when is_integer(value), do: value
+
+  defp integer_value(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _ -> nil
+    end
+  end
+
+  defp integer_value(_value), do: nil
+
+  defp chunks(random_string, chunk_size) when is_binary(random_string) do
+    size = if is_integer(chunk_size) and chunk_size > 0, do: chunk_size, else: 1
+
+    random_string
+    |> String.graphemes()
+    |> Enum.chunk_every(size)
+    |> Enum.map(&Enum.join/1)
+    |> case do
+      [] -> [""]
+      chunks -> chunks
+    end
+  end
+
+  defp chunks(_random_string, _chunk_size), do: [""]
+
+  defp chunk_count(random_string, chunk_size), do: length(chunks(random_string, chunk_size))
+
+  defp maybe_add_missing_decisions(reasons, decisions) do
+    if is_list(decisions) and decisions != [] do
+      reasons
+    else
+      ["missing_decisions" | reasons]
+    end
+  end
+
+  defp minimum_verified_chunks(chunk_count) do
+    max(2, ceil_div(max(1, chunk_count), 3))
+  end
+
+  defp ceil_div(a, b), do: div(a + b - 1, b)
 
   defp capture(text, tag) do
     regex = ~r/<#{tag}>(.*?)<\/#{tag}>/s
@@ -899,13 +1080,12 @@ defmodule AntiAgents.Scoring do
     end
   end
 
-  defp novelty_cell(structural, affect, abstraction, seed_profile) do
+  defp novelty_cell(structural, affect, abstraction, _seed_profile) do
     %{
       length: length_bucket(structural.length),
       sentence_count: sentence_bucket(structural.sentence_count),
       affect: affect,
-      abstraction: abstraction,
-      coverage: coverage_bucket(seed_profile.scope)
+      abstraction: abstraction
     }
   end
 
@@ -918,10 +1098,6 @@ defmodule AntiAgents.Scoring do
   defp sentence_bucket(n) when n <= 3, do: :small
   defp sentence_bucket(n) when n <= 6, do: :medium
   defp sentence_bucket(_), do: :large
-
-  defp coverage_bucket(value) when value < 0.34, do: :low
-  defp coverage_bucket(value) when value < 0.67, do: :mid
-  defp coverage_bucket(_value), do: :high
 
   defp count_words(text), do: token_set(text) |> length()
   defp sentence_count(text), do: String.split(text, ~r/[.!?]+/, trim: true) |> length()
@@ -951,6 +1127,9 @@ defmodule AntiAgents.Scoring do
         "equivalent cli",
         "if you want",
         "refined version of the prompt",
+        "refined prompt you can use",
+        "use this as the prompt",
+        "use this field",
         "rewrite the prompt",
         "format this as"
       ],
@@ -1076,31 +1255,39 @@ defmodule AntiAgents.Scoring do
     (pos - neg) / max(1, Enum.count(words))
   end
 
-  defp abstraction_level(mapping, text) when is_map(mapping) do
-    axis_count = map_size(mapping)
+  defp abstraction_level(text) do
+    words = token_set(text)
+
+    abstract_words =
+      ~w(absence impossible memory language perception spectrum contradiction longing unreal real)
+
+    abstract_count = Enum.count(words, &(&1 in abstract_words))
+    ratio = abstract_count / max(1, length(words))
 
     cond do
-      axis_count >= 6 && String.length(text) > 140 -> :high
-      axis_count >= 4 -> :mid
+      ratio > 0.12 -> :high
+      ratio > 0.04 or String.length(text) > 220 -> :mid
       true -> :low
     end
   end
 
-  defp abstraction_level(_mapping, text) do
-    if String.length(text) > 180, do: :mid, else: :low
-  end
+  defp seed_profile(mapping, seed, chunk_count, verification) do
+    coverage =
+      case verification do
+        %{coverage: verified_coverage} -> verified_coverage
+        _ -> seed_coverage(mapping, chunk_count)
+      end
 
-  defp seed_profile(mapping, seed, chunk_count) do
-    coverage = seed_coverage(mapping, chunk_count)
     chunk_count_map = parse_mapping_coverage(mapping).chunk_count
 
     %{
-      style: "local_rolling_hash",
+      style: "local_sum_mod_hash",
       scope: coverage,
       chunk_count: chunk_count_map,
       chunk_total: chunk_count,
       random_string_length: byte_size(seed),
-      mode: "global_and_local"
+      mode: "global_and_local",
+      verified?: match?(%{valid?: true}, verification)
     }
   end
 
@@ -1258,16 +1445,16 @@ defmodule AntiAgents.Bursts do
     case Scoring.parse_burst_output(text) do
       {:ok, parsed} ->
         chunk_count = chunk_count(parsed.random_string, chunk_size)
-        structured_burst(field, seed, chunk_count, text, parsed)
+        structured_burst(field, seed, chunk_count, chunk_size, text, parsed)
 
       {:error, reason} ->
-        chunk_count = chunk_count(seed, chunk_size)
-        unstructured_burst(field, seed, chunk_count, text, reason)
+        unstructured_burst(field, seed, text, reason)
     end
   end
 
-  defp structured_burst(field, seed, chunk_count, text, parsed) do
+  defp structured_burst(field, seed, chunk_count, chunk_size, text, parsed) do
     mapping = Map.get(parsed, :mapping, %{})
+    verification = Scoring.verify_mapping(mapping, parsed.random_string, chunk_size)
 
     base =
       %BurstResult{
@@ -1275,20 +1462,23 @@ defmodule AntiAgents.Bursts do
         seed: seed,
         random_string: parsed.random_string,
         mapping_trace: mapping,
+        mapping_verification: verification,
         answer: parsed.answer,
         raw_output: text,
         status: :accepted,
         rejection_reason: nil
       }
-      |> Map.put(:seed_coverage, Scoring.seed_coverage(mapping, chunk_count))
+      |> Map.put(:seed_coverage, verification.coverage)
 
-    descriptor = Scoring.descriptor(base.answer, mapping, base.random_string, chunk_count)
+    descriptor =
+      Scoring.descriptor(base.answer, mapping, base.random_string, chunk_count, verification)
+
     candidate = Scoring.enrich(base, descriptor, base.seed_coverage)
 
-    maybe_reject_candidate(candidate, mapping, chunk_count)
+    maybe_reject_candidate(candidate, seed, verification)
   end
 
-  defp maybe_reject_candidate(candidate, mapping, chunk_count) do
+  defp maybe_reject_candidate(candidate, host_seed, verification) do
     cond do
       Scoring.artifact_answer?(candidate.answer) ->
         %{
@@ -1297,7 +1487,28 @@ defmodule AntiAgents.Bursts do
             rejection_reason: "artifact answer / nested control payload"
         }
 
-      Scoring.anti_collapse_fail?(mapping, chunk_count) ->
+      candidate.random_string == host_seed ->
+        %{
+          candidate
+          | status: :rejected,
+            rejection_reason: "random string copied coordinate nonce"
+        }
+
+      reason = random_string_quality_reason(candidate.random_string) ->
+        %{
+          candidate
+          | status: :rejected,
+            rejection_reason: reason
+        }
+
+      verification.valid? == false ->
+        %{
+          candidate
+          | status: :rejected,
+            rejection_reason: "invalid mapping: #{Enum.join(verification.invalid_reasons, ",")}"
+        }
+
+      Scoring.verified_anti_collapse_fail?(verification) ->
         %{candidate | status: :rejected, rejection_reason: "low seed coverage / chunk collapse"}
 
       true ->
@@ -1305,48 +1516,72 @@ defmodule AntiAgents.Bursts do
     end
   end
 
-  defp unstructured_burst(field, seed, chunk_count, text, reason) do
+  defp unstructured_burst(field, seed, text, reason) do
     trimmed = String.trim(text)
 
     if trimmed == "" do
       parse_error_burst(field, seed, reason)
     else
-      synthesized_burst(field, seed, chunk_count, trimmed)
+      unstructured_parse_error_burst(field, seed, trimmed, reason)
     end
   end
 
-  defp synthesized_burst(field, seed, chunk_count, text) do
-    mapping = Scoring.synthesize_mapping(text, field.axes, seed, chunk_count)
-    descriptor = Scoring.descriptor(text, mapping, seed, chunk_count)
-
-    base =
-      %BurstResult{
-        field: field,
-        seed: seed,
-        random_string: seed,
-        mapping_trace: mapping,
-        answer: text,
-        raw_output: text,
-        status: :accepted,
-        rejection_reason: "unstructured model output; synthesized mapping from plain answer"
-      }
-      |> Map.put(:seed_coverage, Scoring.seed_coverage(mapping, chunk_count))
-
-    base
-    |> Scoring.enrich(descriptor, base.seed_coverage)
-    |> maybe_reject_artifact_answer()
+  defp unstructured_parse_error_burst(field, seed, text, reason) do
+    %BurstResult{
+      field: field,
+      seed: seed,
+      random_string: "",
+      mapping_trace: %{},
+      mapping_verification: %{
+        valid?: false,
+        coverage: 0.0,
+        verified_chunk_count: 0,
+        chunk_count: 0,
+        used_chunks: [],
+        invalid_reasons: ["unstructured_output"],
+        decisions: []
+      },
+      answer: text,
+      raw_output: text,
+      status: :parse_error,
+      rejection_reason:
+        "unstructured model output; schema required for SSoT evidence: #{inspect(reason)}"
+    }
   end
 
-  defp maybe_reject_artifact_answer(candidate) do
-    if Scoring.artifact_answer?(candidate.answer) do
-      %{
-        candidate
-        | status: :rejected,
-          rejection_reason: "artifact answer / nested control payload"
-      }
-    else
-      candidate
+  defp random_string_quality_reason(random_string) when is_binary(random_string) do
+    graphemes = String.graphemes(random_string)
+    unique_count = graphemes |> Enum.uniq() |> length()
+    max_run = max_repeated_run(graphemes)
+
+    cond do
+      String.length(random_string) < 8 ->
+        "random string too short"
+
+      unique_count < 4 or max_run >= 5 ->
+        "random string too repetitive"
+
+      true ->
+        nil
     end
+  end
+
+  defp random_string_quality_reason(_random_string), do: "invalid random string"
+
+  defp max_repeated_run([]), do: 0
+
+  defp max_repeated_run([first | rest]) do
+    {_current, current_run, max_run} =
+      Enum.reduce(rest, {first, 1, 1}, fn grapheme, {previous, run, max_run} ->
+        if grapheme == previous do
+          run = run + 1
+          {grapheme, run, max(max_run, run)}
+        else
+          {grapheme, 1, max_run}
+        end
+      end)
+
+    max(current_run, max_run)
   end
 
   defp parse_error_burst(field, seed, reason) do
@@ -1355,6 +1590,7 @@ defmodule AntiAgents.Bursts do
       seed: seed,
       random_string: "",
       mapping_trace: %{},
+      mapping_verification: %{},
       answer: "",
       raw_output: "",
       status: :parse_error,
@@ -1368,6 +1604,7 @@ defmodule AntiAgents.Bursts do
       seed: seed,
       random_string: "",
       mapping_trace: %{},
+      mapping_verification: %{},
       answer: "",
       raw_output: "",
       status: :provider_error,
@@ -1378,7 +1615,7 @@ defmodule AntiAgents.Bursts do
   defp default_burst_options(opts) do
     defaults = [
       heat: [seed: 1.3, assembly: 1.15, answer: 1.05],
-      coordinate: [length: 32, chunk: 5, mapping: :local_rolling_hash],
+      coordinate: [length: 32, chunk: 5, mapping: :local_sum_mod_hash],
       thinking_budget: 1200,
       client: CodexClient,
       codex_opts: [],
@@ -1511,18 +1748,27 @@ defmodule AntiAgents.Frontier do
       |> Enum.map(& &1.descriptor.cell)
       |> Enum.uniq()
 
-    reachable_hits = reachable_hits(accepted, report.reachable_archive)
+    reachable_hits = reachable_hits(rejected_duplicates, report.reachable_archive)
 
     reachable_cell_count = distinct_cell_count(report.reachable_archive)
     archive_size = length(report.frontier_archive)
-
-    delta = length(frontier_cells) - reachable_cell_count
+    frontier_cell_count = length(frontier_cells)
+    novel_frontier_cell_count = frontier_cell_count
+    coverage_delta = avg(accepted, :seed_coverage) - avg(report.reachable_archive, :seed_coverage)
 
     frontier_report = %FrontierReport{
       field: field,
       exemplars: accepted,
       reachable_archive: report.reachable_archive,
-      delta_frontier: Float.round(delta * 1.0, 3),
+      delta_frontier: Float.round(novel_frontier_cell_count * 1.0, 3),
+      frontier_cell_count: frontier_cell_count,
+      reachable_cell_count: reachable_cell_count,
+      novel_frontier_cell_count: novel_frontier_cell_count,
+      coverage_delta: Float.round(coverage_delta, 3),
+      schema_rejected_count: count_status(report.frontier_archive, :parse_error),
+      invalid_mapping_count: count_rejection(report.frontier_archive, "invalid mapping"),
+      duplicate_random_string_count:
+        count_rejection(rejected_duplicates, "duplicate random_string"),
       reachable_hits: reachable_hits,
       rejected_duplicates: rejected_duplicates,
       mapping_traces: Enum.map(report.frontier_archive, & &1.mapping_trace),
@@ -1726,20 +1972,43 @@ defmodule AntiAgents.Frontier do
   end
 
   defp partition_frontier(frontier_archive, reachable_archive) do
-    Enum.reduce(frontier_archive, {[], []}, fn burst, {accepted, rejected} ->
-      case accept_frontier_burst?(burst, accepted, reachable_archive) do
-        true -> {[burst | accepted], rejected}
-        false -> {accepted, [burst | rejected]}
-      end
-    end)
+    {accepted, rejected, _seen_random_strings} =
+      Enum.reduce(frontier_archive, {[], [], MapSet.new()}, fn burst,
+                                                               {accepted, rejected, seen} ->
+        {accepted, rejected, seen} =
+          case accept_frontier_burst?(burst, accepted, reachable_archive, seen) do
+            {:accept, burst} ->
+              {[burst | accepted], rejected, MapSet.put(seen, burst.random_string)}
+
+            {:reject, burst} ->
+              {accepted, [burst | rejected], seen}
+          end
+
+        {accepted, rejected, seen}
+      end)
+
+    {accepted, rejected}
   end
 
-  defp accept_frontier_burst?(%{status: :accepted} = burst, accepted, reachable_archive) do
-    not Scoring.duplicate?(burst, accepted) and
-      not frontier_cell_hit?(burst, reachable_archive)
+  defp accept_frontier_burst?(%{status: :accepted} = burst, accepted, reachable_archive, seen) do
+    cond do
+      MapSet.member?(seen, burst.random_string) ->
+        {:reject,
+         %{burst | status: :rejected, rejection_reason: "duplicate random_string in frontier run"}}
+
+      Scoring.duplicate?(burst, accepted) ->
+        {:reject,
+         %{burst | status: :rejected, rejection_reason: "near duplicate frontier answer"}}
+
+      frontier_cell_hit?(burst, reachable_archive) ->
+        {:reject, %{burst | status: :rejected, rejection_reason: "reachable baseline cell"}}
+
+      true ->
+        {:accept, burst}
+    end
   end
 
-  defp accept_frontier_burst?(_burst, _accepted, _reachable_archive), do: false
+  defp accept_frontier_burst?(burst, _accepted, _reachable_archive, _seen), do: {:reject, burst}
 
   defp reachable_intersections(frontier, reachable) do
     Enum.flat_map(frontier, fn burst ->
@@ -1754,19 +2023,19 @@ defmodule AntiAgents.Frontier do
   defp delta_cell_count(frontier, reachable) do
     frontier_cells =
       frontier
-      |> Enum.filter(&has_descriptor?/1)
+      |> Enum.filter(&(&1.status == :accepted and has_descriptor?(&1)))
       |> Enum.map(& &1.descriptor.cell)
-      |> Enum.uniq()
-      |> length()
+      |> MapSet.new()
 
     reachable_cells =
       reachable
       |> Enum.filter(&has_descriptor?/1)
       |> Enum.map(& &1.descriptor.cell)
-      |> Enum.uniq()
-      |> length()
+      |> MapSet.new()
 
-    frontier_cells - reachable_cells
+    frontier_cells
+    |> MapSet.difference(reachable_cells)
+    |> MapSet.size()
   end
 
   defp has_descriptor?(%{descriptor: %{cell: _}}), do: true
@@ -1780,6 +2049,16 @@ defmodule AntiAgents.Frontier do
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
     |> length()
+  end
+
+  defp count_status(bursts, status), do: Enum.count(bursts, &(&1.status == status))
+
+  defp count_rejection(bursts, needle) do
+    Enum.count(bursts, fn burst ->
+      burst.rejection_reason
+      |> to_string()
+      |> String.contains?(needle)
+    end)
   end
 
   defp reachable_hits(accepted, reachable) do

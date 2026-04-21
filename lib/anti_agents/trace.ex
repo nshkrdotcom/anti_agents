@@ -28,6 +28,10 @@ defmodule AntiAgents.Trace do
       "run" => run(opts),
       "metrics" => json_safe(report.metrics),
       "evidence" => evidence(report),
+      "frontier_cell_count" => report.frontier_cell_count,
+      "reachable_cell_count" => report.reachable_cell_count,
+      "novel_frontier_cell_count" => report.novel_frontier_cell_count,
+      "coverage_delta" => report.coverage_delta,
       "reachable_archive" => Enum.map(report.reachable_archive, &burst(&1, include_raw)),
       "exemplars" => Enum.map(report.exemplars, &burst(&1, include_raw)),
       "rejected_duplicates" => Enum.map(report.rejected_duplicates, &burst(&1, include_raw)),
@@ -88,6 +92,7 @@ defmodule AntiAgents.Trace do
       "seed" => burst.seed,
       "random_string" => burst.random_string,
       "mapping_trace" => json_safe(burst.mapping_trace),
+      "mapping_verification" => json_safe(burst.mapping_verification),
       "answer" => burst.answer,
       "descriptor" => json_safe(burst.descriptor),
       "score" => json_safe(burst.score),
@@ -107,19 +112,27 @@ defmodule AntiAgents.Trace do
 
     %{
       "meaningful_signal" =>
-        accepted_count > 0 and report.delta_frontier > 0 and seed_coverage >= 0.25,
+        accepted_count > 0 and report.novel_frontier_cell_count > 0 and seed_coverage >= 0.5,
       "accepted_frontier_count" => accepted_count,
       "reachable_baseline_count" => length(report.reachable_archive),
       "rejected_duplicate_or_reachable_count" => rejected_count,
       "mapping_trace_count" => length(report.mapping_traces),
       "delta_frontier" => report.delta_frontier,
+      "frontier_cell_count" => report.frontier_cell_count,
+      "reachable_cell_count" => report.reachable_cell_count,
+      "novel_frontier_cell_count" => report.novel_frontier_cell_count,
+      "coverage_delta" => report.coverage_delta,
+      "schema_rejected_count" => report.schema_rejected_count,
+      "invalid_mapping_count" => report.invalid_mapping_count,
+      "duplicate_random_string_count" => report.duplicate_random_string_count,
       "mean_seed_coverage" => seed_coverage,
-      "interpretation" => interpretation(accepted_count, report.delta_frontier, seed_coverage)
+      "interpretation" =>
+        interpretation(accepted_count, report.novel_frontier_cell_count, seed_coverage)
     }
   end
 
   defp interpretation(accepted_count, delta, coverage)
-       when accepted_count > 0 and delta > 0 and coverage >= 0.25 do
+       when accepted_count > 0 and delta > 0 and coverage >= 0.5 do
     "frontier found non-reachable accepted cells with usable seed coverage"
   end
 
@@ -141,6 +154,8 @@ defmodule AntiAgents.Trace do
     |> json_safe()
   end
 
+  defp json_safe(value) when is_boolean(value), do: value
+  defp json_safe(nil), do: nil
   defp json_safe(atom) when is_atom(atom), do: Atom.to_string(atom)
   defp json_safe(other), do: other
 

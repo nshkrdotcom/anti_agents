@@ -22,6 +22,7 @@ fanning out parallel bursts, and measuring novelty against a reachable baseline 
 - [Research context](#research-context)
 - [From SSoT to AntiAgents](#from-ssot-to-antiagents)
 - [Research questions](#research-questions)
+- [Live result](#live-result)
 - [Mechanism](#mechanism)
 - [Experimental trace](#experimental-trace)
 - [Install](#install)
@@ -116,15 +117,93 @@ The live command is intended to make the following questions testable:
 4. **Operational scalability**: Does the SSoT independence property translate
    into practical parallel execution through BEAM tasks and the Codex SDK?
 
-The main reported statistic is `delta_frontier`:
+The current harness has a concrete, falsifiable hypothesis:
+
+> For a fixed field and equal attempted baseline/frontier budget, verified SSoT
+> bursts should produce at least one descriptor cell not occupied by the reachable
+> baseline archive, while preserving mean verified seed coverage above `0.5`.
+
+The main reported statistic is `novel_frontier_cell_count`; `delta_frontier` is
+kept as a compatibility alias:
 
 ```text
-delta_frontier = cells(frontier_archive) - cells(reachable_archive)
+reachable_cells = unique_descriptor_cells(accepted_baselines)
+frontier_cells = unique_descriptor_cells(accepted_frontier)
+
+novel_frontier_cell_count = |frontier_cells \ reachable_cells|
+delta_frontier = novel_frontier_cell_count
 ```
 
 A positive value is not, by itself, a paper-level result. It is a live-run signal
 that the current field, prompt contract, model, temperature, and archive
-descriptors produced frontier cells beyond the reachable baseline set.
+descriptors produced frontier cells beyond the reachable baseline set. The
+current descriptor cell is deliberately simple: `{length, sentence_count, affect,
+abstraction}`. Verified seed usage is measured and scored, but it is not part of
+cell identity.
+
+## Live result
+
+The current hardening pass ran a small live Codex experiment with the following
+command:
+
+```bash
+mix anti_agents.frontier "the memory of a color that does not exist" \
+  --verbose \
+  --heartbeat-ms 5000 \
+  --branching 6 \
+  --concurrency 4 \
+  --temperature 1.1 \
+  --model gpt-5.4-mini \
+  --reasoning low \
+  --baseline 'plain,paraphrase,temp:0.8|1.0|1.2|1.4' \
+  --thinking-budget 1200 \
+  --timeout-ms 240000 \
+  --preview-chars 180 \
+  --out tmp/anti_agents_live_frontier_verified_final3.json
+```
+
+The run attempted 6 baseline calls and 6 SSoT frontier bursts. Four baselines
+entered the reachable archive; two baseline responses were rejected as prompt
+artifacts. All six frontier bursts had valid host-verified mappings, five
+survived reachable-cell filtering, and one was rejected because its descriptor
+cell was already reachable.
+
+```json
+{
+  "attempted_baseline_calls": 6,
+  "accepted_reachable_baselines": 4,
+  "attempted_frontier_bursts": 6,
+  "accepted_frontier_exemplars": 5,
+  "rejected_frontier_after_filter": 1,
+  "reachable_cell_count": 4,
+  "frontier_cell_count": 2,
+  "novel_frontier_cell_count": 2,
+  "delta_frontier": 2.0,
+  "mean_seed_coverage": 0.9714,
+  "coverage_delta": 0.971,
+  "invalid_mapping_count": 0,
+  "schema_rejected_count": 0,
+  "duplicate_random_string_count": 0,
+  "meaningful_signal": true
+}
+```
+
+Accepted frontier exemplars included:
+
+```text
+[coverage=1.0, cell={length: medium, sentence_count: single, affect: low, abstraction: mid}]
+A color without a spectrum, remembered as a pressure behind the eyes: shy, impossible, and still faintly warm.
+
+[coverage=0.857, cell={length: long, sentence_count: small, affect: low, abstraction: mid}]
+I remember the impossible color as a held distance: not a shade, but a location the eye revisits after language has failed. It arrives as a soft contradiction, like warmth without light, and closes by leaving the absence intact.
+```
+
+Interpretation: this is useful evidence that the current SSoT contract can
+produce auditable, non-reachable cells in a live Codex run. It is also modest
+evidence. The field is narrow, the descriptor space is coarse, the default
+distance backend is lexical, and this is not a NoveltyBench reproduction. The
+result should be read as "the harness is experimentally usable and generated a
+positive pilot signal," not as "SSoT frontier search is proved."
 
 ## Mechanism
 
@@ -136,11 +215,15 @@ Each **burst** follows the SSoT protocol:
    - `random_string` — the model-generated entropy string, not the host nonce
    - `mapping` — per-chunk decisions across exploration axes (`ontology`, `metaphor`, `syntax`, `affect`, `contradiction`, `closure`)
    - `answer` — the final generated text
-4. The mapping is audited for **anti-collapse**: responses that reference only the
-   first chunk (prefix collapse) or cover fewer than ⌈N/3⌉ distinct chunks are rejected.
-5. Accepted bursts are scored against a **reachable baseline archive** built from
+4. Each mapping decision must include `axis`, `chunk`, `hash`, `choice`, and
+   `value`. The host recomputes `hash = sum(bytes("#{chunk}:#{chunk_text}")) mod
+   997` from the emitted `random_string`. Invalid hashes or chunk indexes are
+   rejected.
+5. The verified mapping is audited for **anti-collapse**: responses that reference
+   only one chunk or cover fewer than `max(2, ⌈N/3⌉)` distinct chunks are rejected.
+6. Accepted bursts are scored against a **reachable baseline archive** built from
    plain, paraphrase, seed-injection, and temperature-sweep completions of the same field.
-6. Bursts whose descriptor cell matches any baseline cell are filtered into the
+7. Bursts whose descriptor cell matches any baseline cell are filtered into the
    reachable set; the remainder constitute the **frontier**.
 
 Two details are intentionally stricter than a generic demo:
@@ -151,6 +234,9 @@ Two details are intentionally stricter than a generic demo:
 - Artifact guards reject prompt echoes, nested control JSON, malformed
   `random_string` / `mapping` payloads, code-fence output, and SDK/CLI tutorial
   responses before they can enter the reachable or frontier archives.
+- Random-string guards reject nonce copying, very short strings, highly
+  repetitive strings, and duplicate model-generated random strings within one
+  frontier run.
 
 ## Experimental trace
 
@@ -167,7 +253,8 @@ The trace includes:
   or artifacts.
 - `mapping_traces`: the full random-string-to-axis decision traces.
 - `evidence`: summarized fields such as `meaningful_signal`,
-  `reachable_baseline_count`, `accepted_frontier_count`, `delta_frontier`, and
+  `reachable_baseline_count`, `accepted_frontier_count`,
+  `novel_frontier_cell_count`, `coverage_delta`, `invalid_mapping_count`, and
   `mean_seed_coverage`.
 
 With `--verbose`, the command also emits a human-readable run log:
@@ -255,11 +342,18 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
   rejected_duplicates: [%AntiAgents.BurstResult{}, ...],  # duplicate/reachable/rejected burst attempts
   reachable_hits:      [%{descriptor: ..., reason: :reachable, score: ...}, ...],
   mapping_traces:      [%{"decisions" => [...]}, ...],     # audit trail for all frontier attempts
-  delta_frontier:      2.0,                                # accepted frontier cells minus baseline cells
+  delta_frontier:      2.0,                                # compatibility alias for novel_frontier_cell_count
+  frontier_cell_count: 2,
+  reachable_cell_count: 4,
+  novel_frontier_cell_count: 2,
+  coverage_delta:      0.971,
+  schema_rejected_count: 0,
+  invalid_mapping_count: 0,
+  duplicate_random_string_count: 0,
   metrics: %{
-    distinct:         7,     # unique descriptor cells in accepted frontier
+    distinct:         2,     # unique descriptor cells in accepted frontier
     coherence:        0.75,  # mean coherence of accepted bursts
-    seed_coverage:    0.48,  # mean fraction of seed chunks referenced in mapping
+    seed_coverage:    0.97,  # mean fraction of verified seed chunks referenced in mapping
     archive_coverage: 0.83   # accepted / attempted frontier bursts
   }
 }
@@ -272,12 +366,13 @@ Each `%AntiAgents.BurstResult{}` carries:
 | `seed` | coordinate nonce used for this burst |
 | `random_string` | entropy string generated by the model |
 | `mapping_trace` | per-chunk axis decisions (full audit) |
+| `mapping_verification` | host-side hash/chunk verification result |
 | `answer` | final generated text |
 | `status` | `:accepted` \| `:rejected` \| `:parse_error` \| `:provider_error` |
 | `score` | `%{baseline_distance, frontier_distance, seed_coverage, coherence, overall}` |
 | `descriptor` | `%{semantic, structural, affect, abstraction, seed_profile, cell}` |
 | `coherence` | float in [0, 1] |
-| `seed_coverage` | fraction of seed chunks referenced in mapping |
+| `seed_coverage` | fraction of emitted random-string chunks verified as used in mapping |
 
 ## Scoring
 
@@ -293,9 +388,10 @@ overall = 0.50 × baseline_distance
 `baseline_distance` and `frontier_distance` are `1 − max_jaccard_similarity`
 against the respective archive. Near-duplicate detection threshold: 0.91 Jaccard.
 
-Descriptor cells are 5-dimensional buckets `{length, sentence_count, affect,
-abstraction, coverage}` used for archive membership testing. Two bursts occupying
-the same cell are treated as semantically equivalent for frontier accounting.
+Descriptor cells are 4-dimensional buckets `{length, sentence_count, affect,
+abstraction}` used for archive membership testing. Seed coverage is not included
+in the cell. This is important: otherwise SSoT outputs can look novel merely
+because baselines have no mapping trace.
 
 ## CLI
 
@@ -322,8 +418,8 @@ heartbeats with in-flight work, and truncated input/output previews. Use
 
 The `--out` path receives a structured JSON trace (`AntiAgents.Trace`) that includes
 the synthesis claim under test, run parameters, evidence summary (`meaningful_signal`,
-`delta_frontier`, `mean_seed_coverage`), the clean `reachable_archive`, and
-per-exemplar mapping audit trails.
+`novel_frontier_cell_count`, `delta_frontier`, `mean_seed_coverage`), the clean
+`reachable_archive`, and per-exemplar mapping audit trails.
 
 ## Anti-collapse policy
 
@@ -331,12 +427,16 @@ Without explicit checks, SSoT-style prompts collapse: the model selects a single
 global theme from the first seed chunk and ignores the rest. `anti_agents` rejects
 any burst where:
 
-- only one distinct chunk index appears across all mapping decisions (prefix collapse), or
-- fewer than `max(2, ⌈chunk_count / 3⌉)` distinct chunks are referenced.
+- the emitted `random_string` is copied from the host coordinate nonce,
+- the emitted `random_string` is too short or highly repetitive,
+- the emitted `random_string` duplicates another frontier burst in the same run,
+- any decision references an invalid chunk or supplies a wrong hash,
+- only one distinct chunk index appears across all verified mapping decisions, or
+- fewer than `max(2, ⌈chunk_count / 3⌉)` distinct chunks are verified.
 
-When the backend returns unstructured plain text (no JSON), a synthetic mapping is
-deterministically derived from the answer text and the seed so that scoring and
-audit remain consistent. The `rejection_reason` field records this fallback explicitly.
+When the backend returns unstructured plain text from a burst call, the output is
+preserved in the trace as `:parse_error`; it is not promoted into a frontier
+exemplar with a synthetic mapping.
 
 ## Limitations
 
@@ -345,9 +445,10 @@ benchmark implementation.
 
 **Descriptor quality.** The current archive descriptors are deliberately simple:
 semantic fingerprint, structural buckets, affect band, abstraction level, and
-seed-usage profile. They are sufficient for inspecting whether the pipeline works,
-but they are not a substitute for NoveltyBench's full evaluation protocol or a
-learned behavior descriptor.
+seed-usage profile. Archive cell identity currently uses only structural buckets,
+affect band, and text-derived abstraction level. These descriptors are sufficient
+for inspecting whether the pipeline works, but they are not a substitute for
+NoveltyBench's full evaluation protocol or a learned behavior descriptor.
 
 **Distance quality.** The default similarity function uses lexical Jaccard
 distance. This is transparent and cheap, but it misses semantic equivalence and
@@ -383,10 +484,10 @@ Key mappings from the paper to this package:
 | SSoT two-stage instruction | `AntiAgents.Prompt.burst_prompt/2` asks for `random_string`, `mapping`, and `answer` |
 | Full parallelizability | `AntiAgents.branch/3` and baseline archive construction use `Task.async_stream` |
 | NoveltyBench comparison against baseline, paraphrase, and temperature | `AntiAgents.frontier/2` builds a reachable archive from `:plain`, `:paraphrase`, `:seed_injection`, and `{:temperature, [...]}` |
-| DAG strategy: templates plus local random selection | `mapping.decisions` requires chunk-local axis decisions over ontology, metaphor, syntax, affect, contradiction, and closure |
+| DAG strategy: templates plus local random selection | `mapping.decisions` requires chunk-local axis decisions over ontology, metaphor, syntax, affect, contradiction, and closure, with host-verifiable `hash` and `choice` fields |
 | Simple SSoT prompt components | The prompt contract preserves explicit string generation, manipulation, and final answer extraction |
 | External randomness/tool-call limitations | Host nonces are used only for trace identity; the model must emit its own `random_string`; no model-visible tool calls are required |
-| Bias propagation from lazy prefix use | Anti-collapse rejects prefix-only and low-coverage mappings |
+| Bias propagation from lazy prefix use | Anti-collapse rejects prefix-only mappings, low verified coverage, nonce copying, repetitive strings, and duplicate model random strings |
 | Reasoning-capability dependence | README and trace surface `reasoning_effort`, `thinking_budget`, `seed_coverage`, and rejection reasons |
 
 The main extension beyond the paper is **counterfactual frontier accounting**:

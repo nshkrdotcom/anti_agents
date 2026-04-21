@@ -47,7 +47,7 @@ defmodule AntiAgents.MixProject do
     [
       name: "anti_agents",
       description:
-        "Frontier prompting, burst branching, and novelty scoring for Codex-backed agent experiments.",
+        "SSoT frontier prompting, burst branching, and novelty scoring for Codex-backed diversity experiments.",
       files: [
         "lib",
         "assets",

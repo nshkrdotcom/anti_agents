@@ -98,7 +98,7 @@ defmodule AntiAgents.CLI do
       coordinate: [
         length: Keyword.get(opts, :length, 32),
         chunk: Keyword.get(opts, :chunk, 5),
-        mapping: :local_rolling_hash
+        mapping: :local_sum_mod_hash
       ],
       baseline: parse_baseline(Keyword.get(opts, :baseline))
     ]
