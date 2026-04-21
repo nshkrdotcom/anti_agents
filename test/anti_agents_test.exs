@@ -1,5 +1,7 @@
 defmodule AntiAgentsTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
+
+  import ExUnit.CaptureIO
 
   alias AntiAgents.{BurstResult, Field, FrontierReport}
   alias AntiAgents.{Bursts, Progress, Scoring}
@@ -437,6 +439,52 @@ defmodule AntiAgentsTest do
 
       assert result == :ok
       assert_receive {:progress, :heartbeat, %{label: :test_run, tick: 1}}
+    end
+
+    test "verbose progress explains the run plan, stage purpose, and previews" do
+      output =
+        capture_io(:stderr, fn ->
+          Progress.with_heartbeat(
+            [verbose: true, heartbeat_ms: 50, preview_chars: 60],
+            :test_run,
+            fn opts ->
+              Progress.event(opts, :run_plan, %{
+                baseline_calls: 2,
+                frontier_bursts: 3,
+                total_llm_calls: 5,
+                concurrency: 2
+              })
+
+              Progress.event(opts, :baseline_start, %{methods: 2})
+
+              Progress.event(opts, :baseline_call_start, %{
+                index: 1,
+                total: 2,
+                llm_index: 1,
+                llm_total: 5,
+                method: "plain",
+                input_preview: "Field prompt with enough detail to preview in logs"
+              })
+
+              Progress.event(opts, :baseline_call_done, %{
+                index: 1,
+                total: 2,
+                llm_index: 1,
+                llm_total: 5,
+                method: "plain",
+                answer_length: 128,
+                output_preview: "Truncated baseline model output preview"
+              })
+            end
+          )
+        end)
+
+      assert output =~ "Plan: 5 LLM calls = 2 baseline + 3 frontier bursts"
+      assert output =~ "Stage 1/3 baseline reachable archive"
+      assert output =~ "LLM 1/5 baseline 1/2 plain started"
+      assert output =~ "Why: define cells"
+      assert output =~ "input=\"Field prompt"
+      assert output =~ "preview=\"Truncated baseline"
     end
 
     test "serializes a frontier report into traceable evidence" do

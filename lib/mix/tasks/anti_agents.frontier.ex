@@ -30,6 +30,8 @@ defmodule Mix.Tasks.AntiAgents.Frontier do
       })
 
       if Keyword.get(opts, :dry_run, false) do
+        emit_run_plan(opts)
+
         AntiAgents.Trace.dry_run(prompt, opts)
         |> emit_trace(opts)
       else
@@ -49,9 +51,40 @@ defmodule Mix.Tasks.AntiAgents.Frontier do
     end)
   end
 
+  defp emit_run_plan(opts) do
+    baseline_calls =
+      opts
+      |> Keyword.get(:baseline, [])
+      |> baseline_call_count()
+
+    frontier_bursts = Keyword.get(opts, :branching, 8)
+
+    AntiAgents.Progress.event(opts, :run_plan, %{
+      baseline_calls: baseline_calls,
+      frontier_bursts: frontier_bursts,
+      total_llm_calls: baseline_calls + frontier_bursts,
+      concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
+    })
+  end
+
   defp run_opts(opts) do
     Keyword.drop(opts, [:dry_run, :field, :include_raw, :out])
   end
+
+  defp baseline_call_count(methods) do
+    methods
+    |> Enum.flat_map(&expand_baseline_method/1)
+    |> length()
+  end
+
+  defp expand_baseline_method(:plain), do: [:plain]
+  defp expand_baseline_method(:paraphrase), do: [:paraphrase]
+  defp expand_baseline_method(:seed_injection), do: [:seed_injection]
+
+  defp expand_baseline_method({:temperature, temps}) when is_list(temps),
+    do: Enum.map(temps, &{:temperature, &1})
+
+  defp expand_baseline_method(_method), do: []
 
   defp emit_trace(trace, opts) do
     encoded = Jason.encode!(trace, pretty: true)
