@@ -27,12 +27,20 @@ mix anti_agents.benchmark \
   --branching 8 \
   --repetitions 3 \
   --distance embedding \
+  --embedding-model gemini-embedding-001 \
+  --embedding-task-type clustering \
+  --embedding-dimensions 768 \
   --frontier-temperature-sweep '1.0|1.1|1.2' \
+  --expensive \
   --out tmp/anti_agents_benchmark.json
 ```
 
 Use `--dry-run` first to inspect provider call count. Larger runs must pass
 `--expensive`.
+
+The evidence profile configures `AntiAgents.Embedding.GeminiClient`, which uses
+`gemini_ex` batch embeddings. A live evidence run requires `GEMINI_API_KEY` or
+Vertex credentials supported by `gemini_ex`.
 
 Before interpreting any live benchmark result, run:
 
@@ -57,6 +65,7 @@ Any cited benchmark number requires:
 - `repetitions >= 3`
 - `--profile priv/profiles/evidence.json`
 - `--distance embedding` with integer `semantic_cluster` descriptor values
+- Gemini embedding metadata recorded in `run.embedding`
 - explicit frontier temperature points recorded as `frontier_temperature_points`
 - a non-diagnostic output mode
 - a calibration run that passed on the same calendar day

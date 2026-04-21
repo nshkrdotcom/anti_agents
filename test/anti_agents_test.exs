@@ -5,6 +5,7 @@ defmodule AntiAgentsTest do
 
   alias AntiAgents.{BurstResult, Field, FrontierReport}
   alias AntiAgents.{Bursts, Distance, Progress, Scoring, Statistics}
+  alias AntiAgents.Embedding.GeminiClient
   alias Mix.Tasks.AntiAgents.Benchmark, as: BenchmarkTask
   alias Mix.Tasks.AntiAgents.Calibrate, as: CalibrateTask
   alias Mix.Tasks.AntiAgents.Frontier, as: FrontierTask
@@ -263,6 +264,20 @@ defmodule AntiAgentsTest do
         end)
 
       {:ok, vectors}
+    end
+  end
+
+  defmodule FakeGeminiEmbeddingAPI do
+    def batch_embed_contents(texts, opts) do
+      send(self(), {:gemini_batch_embed, texts, opts})
+
+      embeddings =
+        Enum.map(texts, fn
+          "cat" -> %{values: [3.0, 4.0]}
+          _text -> %{values: [0.0, 10.0]}
+        end)
+
+      {:ok, %{embeddings: embeddings}}
     end
   end
 
@@ -559,6 +574,27 @@ defmodule AntiAgentsTest do
 
       assert {:error, :judge_backend_not_configured} =
                Distance.Judge.pairwise("a", "b", [])
+    end
+
+    test "gemini embedding client batch embeds with model options and normalizes short vectors" do
+      assert {:ok, [cat, ocean]} =
+               GeminiClient.embed(["cat", "ocean"],
+                 gemini_module: FakeGeminiEmbeddingAPI,
+                 embedding_model: "gemini-embedding-001",
+                 embedding_task_type: "semantic-similarity",
+                 embedding_dimensions: 2,
+                 embedding_auth: :gemini
+               )
+
+      assert_receive {:gemini_batch_embed, ["cat", "ocean"], opts}
+      assert opts[:model] == "gemini-embedding-001"
+      assert opts[:task_type] == :semantic_similarity
+      assert opts[:output_dimensionality] == 2
+      assert opts[:auth] == :gemini
+
+      assert_in_delta Enum.at(cat, 0), 0.6, 0.0001
+      assert_in_delta Enum.at(cat, 1), 0.8, 0.0001
+      assert ocean == [0.0, 1.0]
     end
 
     test "fit_centroids is idempotent when k covers unique inputs" do
@@ -1424,6 +1460,31 @@ defmodule AntiAgentsTest do
       assert opts[:field][:away_from] == ["standard sci-fi"]
     end
 
+    test "CLI configures Gemini embeddings when embedding distance is requested" do
+      assert {:ok, {_prompt, opts}} =
+               AntiAgents.CLI.parse_frontier_args([
+                 "embedding",
+                 "field",
+                 "--distance",
+                 "embedding",
+                 "--embedding-model",
+                 "gemini-embedding-001",
+                 "--embedding-task-type",
+                 "semantic-similarity",
+                 "--embedding-dimensions",
+                 "768",
+                 "--embedding-auth",
+                 "gemini"
+               ])
+
+      assert opts[:distance] == :embedding
+      assert opts[:embedding_client] == GeminiClient
+      assert opts[:embedding_model] == "gemini-embedding-001"
+      assert opts[:embedding_task_type] == :semantic_similarity
+      assert opts[:embedding_dimensions] == 768
+      assert opts[:embedding_auth] == :gemini
+    end
+
     test "CLI rejects invalid options and empty prompts" do
       assert {:error, usage} = AntiAgents.CLI.parse_frontier_args(["--dry-run"])
       assert usage =~ "Usage:"
@@ -1670,6 +1731,9 @@ defmodule AntiAgentsTest do
           "baseline" => ["plain"],
           "frontier_temperature_sweep" => [1.0, 1.2],
           "distance" => "embedding",
+          "embedding_model" => "gemini-embedding-001",
+          "embedding_task_type" => "clustering",
+          "embedding_dimensions" => 768,
           "bootstrap_resamples" => 123
         })
       )
@@ -1696,6 +1760,10 @@ defmodule AntiAgentsTest do
       assert output =~ "\"branching\": 4"
       assert output =~ "\"profile_overrides\""
       assert output =~ "\"reasoning_effort\": \"low\""
+      assert output =~ "\"client\": \"gemini_ex\""
+      assert output =~ "\"model\": \"gemini-embedding-001\""
+      assert output =~ "\"task_type\": \"clustering\""
+      assert output =~ "\"dimensions\": 768"
       assert output =~ "\"planned_llm_calls\": 18"
     after
       File.rm("tmp/test_fields.json")
@@ -1759,6 +1827,7 @@ defmodule AntiAgentsTest do
                 baseline_calls: 1,
                 frontier_bursts: 1,
                 matched_baseline_calls: 1,
+                matched_baseline_dynamic: true,
                 total_llm_calls: 3,
                 concurrency: 4
               })
@@ -1785,7 +1854,7 @@ defmodule AntiAgentsTest do
       assert output =~ "36 planned LLM calls"
       assert output =~ "Benchmark run 6/12 | field 6/12 city-forget"
       assert output =~ "completed_llm=15/36"
-      assert output =~ "benchmark run 6/12 field=city-forget | Plan: 3 LLM calls"
+      assert output =~ "benchmark run 6/12 field=city-forget | Plan: up to 3 LLM calls"
       assert output =~ "benchmark run 6/12 field=city-forget | LLM 16/36"
       assert output =~ "local LLM 1/3 baseline 1/1 plain started"
       assert output =~ "stage=benchmark run 6/12 field 6/12 city-forget; LLM 15/36"
@@ -1856,6 +1925,36 @@ defmodule AntiAgentsTest do
       assert output =~ "Why: define cells"
       assert output =~ "input=\"Field prompt"
       assert output =~ "preview=\"Truncated baseline"
+    end
+
+    test "verbose progress marks matched-baseline continuations as dynamic" do
+      output =
+        capture_io(:stderr, fn ->
+          Progress.with_heartbeat([verbose: true, heartbeat_ms: 50], :test_run, fn opts ->
+            Progress.event(opts, :run_plan, %{
+              baseline_calls: 1,
+              frontier_bursts: 2,
+              matched_baseline_calls: 2,
+              matched_baseline_dynamic: true,
+              total_llm_calls: 5,
+              concurrency: 2
+            })
+
+            Progress.event(opts, :matched_baseline_start, %{
+              accepted_frontier_count: 1,
+              reachable_baseline_calls: 1,
+              matched_baseline_calls: 1,
+              actual_total_llm_calls: 4,
+              planned_total_llm_calls: 5
+            })
+          end)
+        end)
+
+      assert output =~ "Plan: up to 5 LLM calls"
+      assert output =~ "up to 2 matched-baseline continuation"
+      assert output =~ "Matched-baseline calls run only for accepted frontier bursts"
+      assert output =~ "actual_llm_total=4"
+      assert output =~ "initial_max_llm_total=5"
     end
 
     test "verbose progress covers errors, rejections, frontier, trace, and heartbeat summaries" do
@@ -2055,10 +2154,22 @@ defmodule AntiAgentsTest do
         metrics: %{distinct: 1, coherence: 0.8, seed_coverage: 0.5, archive_coverage: 1.0}
       }
 
-      trace = AntiAgents.Trace.report(report, model: "gpt-5.4-mini", reasoning_effort: :low)
+      trace =
+        AntiAgents.Trace.report(report,
+          model: "gpt-5.4-mini",
+          reasoning_effort: :low,
+          embedding_client: GeminiClient,
+          embedding_model: "gemini-embedding-001",
+          embedding_task_type: :clustering,
+          embedding_dimensions: 768
+        )
 
       assert trace["synthesis"]["essential_aspect"] =~ "entropy-first"
       assert trace["run"]["model"] == "gpt-5.4-mini"
+      assert trace["run"]["embedding"]["client"] == "gemini_ex"
+      assert trace["run"]["embedding"]["model"] == "gemini-embedding-001"
+      assert trace["run"]["embedding"]["task_type"] == "clustering"
+      assert trace["run"]["embedding"]["dimensions"] == 768
       assert trace["run"]["semantic_descriptor_status"] == "embedding"
       assert trace["run"]["semantic_centroid_ids"] == ["abc123"]
       refute Map.has_key?(trace["evidence"], "meaningful_signal")

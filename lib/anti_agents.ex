@@ -1909,6 +1909,7 @@ defmodule AntiAgents.Frontier do
       baseline_calls: baseline_count,
       frontier_bursts: planned_frontier_calls,
       matched_baseline_calls: planned_matched_calls,
+      matched_baseline_dynamic: matched_budget?,
       total_llm_calls: total_llm_calls,
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
     })
@@ -1933,6 +1934,17 @@ defmodule AntiAgents.Frontier do
       frontier_rounds(field, branch_count, rounds, opts, baseline_count, total_llm_calls)
 
     accepted_frontier_count = Enum.count(frontier_bursts, &(&1.status == :accepted))
+    actual_total_llm_calls = baseline_count + planned_frontier_calls + accepted_frontier_count
+
+    if matched_budget? do
+      Progress.event(opts, :matched_baseline_start, %{
+        accepted_frontier_count: accepted_frontier_count,
+        reachable_baseline_calls: baseline_count,
+        matched_baseline_calls: accepted_frontier_count,
+        actual_total_llm_calls: actual_total_llm_calls,
+        planned_total_llm_calls: total_llm_calls
+      })
+    end
 
     {matched_baseline, matched_stats} =
       if matched_budget? and accepted_frontier_count > 0 do
@@ -1942,7 +1954,7 @@ defmodule AntiAgents.Frontier do
           Keyword.merge(opts,
             matched_baseline_count: accepted_frontier_count,
             progress_llm_offset: baseline_count + planned_frontier_calls,
-            progress_llm_total: total_llm_calls
+            progress_llm_total: actual_total_llm_calls
           )
         )
       else

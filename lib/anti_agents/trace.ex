@@ -2,6 +2,7 @@ defmodule AntiAgents.Trace do
   @moduledoc false
 
   alias AntiAgents.{BurstResult, Field, FrontierReport}
+  alias AntiAgents.Embedding.GeminiClient
 
   def dry_run(prompt, opts) do
     %{
@@ -95,6 +96,7 @@ defmodule AntiAgents.Trace do
       "baseline" => json_safe(Keyword.get(opts, :baseline, [])),
       "coordinate" => json_safe(Keyword.get(opts, :coordinate, [])),
       "thinking_budget" => Keyword.get(opts, :thinking_budget, 1200),
+      "embedding" => embedding_summary(opts),
       "semantic_descriptor_status" => semantic_descriptor_status(report),
       "semantic_centroid_ids" => semantic_centroid_ids(report)
     }
@@ -107,6 +109,38 @@ defmodule AntiAgents.Trace do
 
   defp semantic_centroid_ids(%FrontierReport{} = report), do: report.semantic_centroid_ids
   defp semantic_centroid_ids(_report), do: []
+
+  defp embedding_summary(opts) do
+    case Keyword.get(opts, :embedding_client) do
+      GeminiClient ->
+        %{
+          "client" => "gemini_ex",
+          "model" => Keyword.get(opts, :embedding_model, GeminiClient.default_model()),
+          "task_type" =>
+            opts
+            |> Keyword.get(:embedding_task_type)
+            |> GeminiClient.normalize_task_type()
+            |> Atom.to_string(),
+          "dimensions" =>
+            Keyword.get(
+              opts,
+              :embedding_dimensions,
+              GeminiClient.default_dimensions()
+            ),
+          "auth" => embedding_auth(opts)
+        }
+
+      _other ->
+        nil
+    end
+  end
+
+  defp embedding_auth(opts) do
+    case Keyword.get(opts, :embedding_auth) do
+      nil -> nil
+      auth -> Atom.to_string(auth)
+    end
+  end
 
   defp frontier_temperature_points(opts) do
     case Keyword.get(opts, :frontier_temperature_sweep, []) do

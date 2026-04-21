@@ -66,6 +66,7 @@ defmodule Mix.Tasks.AntiAgents.Frontier do
       baseline_calls: baseline_calls,
       frontier_bursts: frontier_bursts,
       matched_baseline_calls: matched_baseline_calls,
+      matched_baseline_dynamic: Keyword.get(opts, :matched_budget, true),
       total_llm_calls: baseline_calls + frontier_bursts + matched_baseline_calls,
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
     })

@@ -202,6 +202,19 @@ defmodule AntiAgents.Progress do
     }
   end
 
+  defp apply_event(state, :matched_baseline_start, metadata, _opts) do
+    reachable = metadata[:reachable_baseline_calls] || 0
+    matched = metadata[:matched_baseline_calls] || 0
+
+    %{
+      state
+      | stage: :matched_baseline,
+        stage_detail: "running matched baseline continuation",
+        llm_total: metadata[:actual_total_llm_calls] || state.llm_total,
+        baseline_total: reachable + matched
+    }
+  end
+
   defp apply_event(state, :baseline_call_start, metadata, opts),
     do:
       put_inflight(
@@ -311,8 +324,28 @@ defmodule AntiAgents.Progress do
 
   defp message(:run_plan, metadata, _snapshot, opts) do
     matched = metadata[:matched_baseline_calls] || 0
+    dynamic? = metadata[:matched_baseline_dynamic] || false
+    prefix = if dynamic?, do: "Plan: up to", else: "Plan:"
 
-    "#{benchmark_context(opts)}Plan: #{metadata[:total_llm_calls]} LLM calls = #{metadata[:baseline_calls]} baseline + #{metadata[:frontier_bursts]} frontier bursts + #{matched} matched-baseline continuation, concurrency=#{metadata[:concurrency]}. Baseline maps what ordinary prompting can reach; frontier keeps SSoT bursts that land outside that map."
+    matched_text =
+      if dynamic? do
+        "up to #{matched} matched-baseline continuation"
+      else
+        "#{matched} matched-baseline continuation"
+      end
+
+    suffix =
+      if dynamic? do
+        " Matched-baseline calls run only for accepted frontier bursts."
+      else
+        ""
+      end
+
+    "#{benchmark_context(opts)}#{prefix} #{metadata[:total_llm_calls]} LLM calls = #{metadata[:baseline_calls]} baseline + #{metadata[:frontier_bursts]} frontier bursts + #{matched_text}, concurrency=#{metadata[:concurrency]}. Baseline maps what ordinary prompting can reach; frontier keeps SSoT bursts that land outside that map.#{suffix}"
+  end
+
+  defp message(:matched_baseline_start, metadata, _snapshot, _opts) do
+    "Matched-baseline continuation: #{metadata[:matched_baseline_calls]} calls for #{metadata[:accepted_frontier_count]} accepted frontier bursts | actual_llm_total=#{metadata[:actual_total_llm_calls]} | initial_max_llm_total=#{metadata[:planned_total_llm_calls]}"
   end
 
   defp message(:compare_start, metadata, _snapshot, _opts) do

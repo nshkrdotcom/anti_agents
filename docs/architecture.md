@@ -25,7 +25,9 @@ Field
   matched-budget comparison, archive-feedback rounds, and report assembly.
 - Scoring layer: mapping verification, descriptor cells, coherence,
   scoring weights, and fallback lexical similarity.
-- Distance layer: pluggable similarity backend behavior.
+- Distance layer: pluggable similarity backend behavior; the production
+  embedding adapter is `AntiAgents.Embedding.GeminiClient`, backed by
+  `gemini_ex` batch embeddings.
 - Statistics layer: distinct-cell counts and bootstrap confidence
   intervals.
 - Trace writer: JSON evidence report.
@@ -53,6 +55,12 @@ Descriptor saturation is tracked separately through `empirical_cell_space`,
 `saturation`, and `cell_saturation_warning`. If too many runs saturate the
 available descriptor space, the benchmark-level `calibration_status` is set to
 `descriptor_saturated`.
+
+When `distance: :embedding` is used through the CLI, reachable baseline answers
+are embedded with Gemini, fitted into centroids, and then reused to assign
+integer `semantic_cluster` values to baseline, frontier, and matched-baseline
+outputs. If the embedding provider is missing or fails, the descriptor status
+degrades explicitly and `semantic_cluster` remains `:unknown`.
 
 ## Boundary
 

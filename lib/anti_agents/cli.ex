@@ -1,6 +1,8 @@
 defmodule AntiAgents.CLI do
   @moduledoc false
 
+  alias AntiAgents.Embedding.GeminiClient
+
   @switches [
     dry_run: :boolean,
     include_raw: :boolean,
@@ -25,6 +27,10 @@ defmodule AntiAgents.CLI do
     reasoning: :string,
     baseline: :string,
     distance: :string,
+    embedding_model: :string,
+    embedding_task_type: :string,
+    embedding_dimensions: :integer,
+    embedding_auth: :string,
     out: :string,
     toward: :keep,
     away_from: :keep
@@ -74,6 +80,10 @@ defmodule AntiAgents.CLI do
                               run equal-size baseline continuation, default true
       --bootstrap-resamples N percentile bootstrap resamples, default 2000
       --distance BACKEND      jaccard, embedding, or judge; default jaccard
+      --embedding-model MODEL Gemini embedding model, default gemini-embedding-001
+      --embedding-task-type T  Gemini task type, default clustering
+      --embedding-dimensions N Gemini output dimensionality, default 768
+      --embedding-auth AUTH   optional gemini_ex auth strategy: gemini or vertex_ai
       --out PATH              write JSON trace to PATH
       --verbose               emit step-by-step progress and heartbeat logs
       --heartbeat-ms N        verbose heartbeat interval, default 5000
@@ -84,6 +94,7 @@ defmodule AntiAgents.CLI do
 
   defp frontier_opts(opts) do
     answer_temperature = Keyword.get(opts, :temperature, 1.05)
+    distance = opts |> Keyword.get(:distance, "jaccard") |> parse_distance()
 
     frontier_temperature_sweep =
       parse_temperature_sweep(Keyword.get(opts, :frontier_temperature_sweep))
@@ -106,7 +117,7 @@ defmodule AntiAgents.CLI do
       baseline_retry_budget: Keyword.get(opts, :baseline_retry_budget, 2),
       matched_budget: Keyword.get(opts, :matched_budget, true),
       bootstrap_resamples: Keyword.get(opts, :bootstrap_resamples, 2_000),
-      distance: opts |> Keyword.get(:distance, "jaccard") |> parse_distance(),
+      distance: distance,
       frontier_temperature_sweep: frontier_temperature_sweep,
       matched_baseline_methods:
         matched_baseline_methods(frontier_temperature_sweep, answer_temperature),
@@ -128,6 +139,7 @@ defmodule AntiAgents.CLI do
       ],
       baseline: parse_baseline(Keyword.get(opts, :baseline))
     ]
+    |> Keyword.merge(embedding_opts(distance, opts))
   end
 
   defp parse_baseline(nil),
@@ -156,6 +168,31 @@ defmodule AntiAgents.CLI do
   defp parse_distance("embedding"), do: :embedding
   defp parse_distance("judge"), do: :judge
   defp parse_distance(_other), do: :jaccard
+
+  defp embedding_opts(:embedding, opts) do
+    [
+      embedding_client: GeminiClient,
+      embedding_model: Keyword.get(opts, :embedding_model, GeminiClient.default_model()),
+      embedding_task_type:
+        opts
+        |> Keyword.get(:embedding_task_type)
+        |> GeminiClient.normalize_task_type(),
+      embedding_dimensions:
+        Keyword.get(
+          opts,
+          :embedding_dimensions,
+          GeminiClient.default_dimensions()
+        )
+    ]
+    |> maybe_embedding_auth(Keyword.get(opts, :embedding_auth))
+  end
+
+  defp embedding_opts(_distance, _opts), do: []
+
+  defp maybe_embedding_auth(opts, nil), do: opts
+  defp maybe_embedding_auth(opts, "gemini"), do: Keyword.put(opts, :embedding_auth, :gemini)
+  defp maybe_embedding_auth(opts, "vertex_ai"), do: Keyword.put(opts, :embedding_auth, :vertex_ai)
+  defp maybe_embedding_auth(opts, _other), do: opts
 
   defp parse_temperature_list(temps) do
     temps

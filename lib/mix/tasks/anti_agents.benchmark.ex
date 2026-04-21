@@ -5,6 +5,8 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
 
   use Mix.Task
 
+  alias AntiAgents.Embedding.GeminiClient
+
   @shortdoc "Runs a matched-budget AntiAgents benchmark"
 
   @switches [
@@ -24,6 +26,10 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     reasoning: :string,
     temperature: :float,
     frontier_temperature_sweep: :string,
+    embedding_model: :string,
+    embedding_task_type: :string,
+    embedding_dimensions: :integer,
+    embedding_auth: :string,
     bootstrap_resamples: :integer,
     baseline_retry_budget: :integer,
     heartbeat_ms: :integer,
@@ -61,6 +67,10 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       --baseline LIST           plain,paraphrase,seed_injection,temp:0.8|1.0|1.2
       --frontier-temperature-sweep LIST
                                 round-robin frontier temperatures, e.g. 1.0|1.1|1.2
+      --embedding-model MODEL   Gemini embedding model, default gemini-embedding-001
+      --embedding-task-type T    Gemini task type, default clustering
+      --embedding-dimensions N   Gemini output dimensionality, default 768
+      --embedding-auth AUTH      optional gemini_ex auth strategy: gemini or vertex_ai
       --bootstrap-resamples N   default 2000
       --heartbeat-ms N          verbose heartbeat interval, default 5000
       --preview-chars N         chars of prompt/output preview, default 180
@@ -73,6 +83,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     fields = Keyword.get(opts, :fields) || Mix.raise("--fields is required")
     profile_path = Keyword.get(opts, :profile)
     profile = load_profile(profile_path)
+    distance = option(opts, profile, :distance, "jaccard")
 
     %{
       fields_path: fields,
@@ -87,7 +98,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       repetitions: option(opts, profile, :repetitions, 3),
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
       rounds: option(opts, profile, :rounds, 1),
-      distance: option(opts, profile, :distance, "jaccard"),
+      distance: distance,
       baseline: parse_baseline(option(opts, profile, :baseline, nil)),
       model: option(opts, profile, :model, AntiAgents.CodexConfig.default_model()),
       reasoning_effort:
@@ -100,6 +111,29 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       temperature: option(opts, profile, :temperature, 1.05),
       frontier_temperature_sweep:
         parse_temperature_sweep(option(opts, profile, :frontier_temperature_sweep, nil)),
+      embedding_model:
+        option(
+          opts,
+          profile,
+          :embedding_model,
+          GeminiClient.default_model()
+        ),
+      embedding_task_type:
+        opts
+        |> option(
+          profile,
+          :embedding_task_type,
+          GeminiClient.default_task_type()
+        )
+        |> GeminiClient.normalize_task_type(),
+      embedding_dimensions:
+        option(
+          opts,
+          profile,
+          :embedding_dimensions,
+          GeminiClient.default_dimensions()
+        ),
+      embedding_auth: parse_embedding_auth(option(opts, profile, :embedding_auth, nil)),
       bootstrap_resamples: option(opts, profile, :bootstrap_resamples, 2_000),
       baseline_retry_budget: Keyword.get(opts, :baseline_retry_budget, 2),
       heartbeat_ms: Keyword.get(opts, :heartbeat_ms, 5_000),
@@ -136,6 +170,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
           "matched_baseline_calls_per_run" => frontier_calls,
           "planned_llm_calls" => planned_llm_calls,
           "distance" => config.distance,
+          "embedding" => embedding_summary(config),
           "rounds" => config.rounds,
           "frontier_temperature_points" => frontier_temperature_points(config),
           "matched_baseline_temperature_points" => matched_baseline_temperature_points(config)
@@ -219,6 +254,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       "branching" => config.branching,
       "repetitions" => config.repetitions,
       "distance" => config.distance,
+      "embedding" => embedding_summary(config),
       "frontier_temperature_points" => frontier_temperature_points(config),
       "matched_baseline_temperature_points" => matched_baseline_temperature_points(config)
     }
@@ -297,7 +333,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
         verbose: ctx.config.verbose,
         progress_state: Keyword.get(ctx.progress_opts, :progress_state),
         heat: [answer: ctx.config.temperature]
-      ] ++ benchmark_opts
+      ] ++ benchmark_opts ++ embedding_opts(ctx.config)
 
     report = AntiAgents.frontier(field, opts)
 
@@ -502,6 +538,37 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       _method -> []
     end)
   end
+
+  defp embedding_opts(%{distance: "embedding"} = config) do
+    [
+      embedding_client: GeminiClient,
+      embedding_model: config.embedding_model,
+      embedding_task_type: config.embedding_task_type,
+      embedding_dimensions: config.embedding_dimensions
+    ]
+    |> maybe_embedding_auth(config.embedding_auth)
+  end
+
+  defp embedding_opts(_config), do: []
+
+  defp embedding_summary(%{distance: "embedding"} = config) do
+    %{
+      "client" => "gemini_ex",
+      "model" => config.embedding_model,
+      "task_type" => Atom.to_string(config.embedding_task_type),
+      "dimensions" => config.embedding_dimensions,
+      "auth" => if(config.embedding_auth, do: Atom.to_string(config.embedding_auth), else: nil)
+    }
+  end
+
+  defp embedding_summary(_config), do: nil
+
+  defp maybe_embedding_auth(opts, nil), do: opts
+  defp maybe_embedding_auth(opts, auth), do: Keyword.put(opts, :embedding_auth, auth)
+
+  defp parse_embedding_auth("gemini"), do: :gemini
+  defp parse_embedding_auth("vertex_ai"), do: :vertex_ai
+  defp parse_embedding_auth(_other), do: nil
 
   defp parse_distance("embedding"), do: :embedding
   defp parse_distance("judge"), do: :judge

@@ -32,3 +32,6 @@
 - C9: Added `mix anti_agents.calibrate --stubbed` as the QC positive control.
 - C10: Reserved README evidence reporting until an embedding-backed,
   expensive-gated evidence run is deliberately executed.
+- C11: Added `gemini_ex` 0.13.0 as the production embedding provider for
+  evidence runs, using `gemini-embedding-001` batch embeddings through the
+  existing embedding-client seam.

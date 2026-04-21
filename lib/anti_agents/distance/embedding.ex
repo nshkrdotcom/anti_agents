@@ -2,9 +2,9 @@ defmodule AntiAgents.Distance.Embedding do
   @moduledoc """
   Embedding cosine-similarity backend with an injectable embedding client.
 
-  The production provider adapter is intentionally not hard-coded here. Callers
-  pass `:embedding_client`, a module implementing `embed/2`, so tests and future
-  provider integrations use the same path.
+  Callers pass `:embedding_client`, a module implementing `embed/2`. The
+  production CLI path uses `AntiAgents.Embedding.GeminiClient`; tests can inject
+  deterministic clients through the same seam.
   """
 
   @behaviour AntiAgents.Distance

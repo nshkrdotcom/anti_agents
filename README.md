@@ -259,6 +259,10 @@ The default 12-field, 3-repetition plan reports:
 }
 ```
 
+`matched_baseline_calls_per_run` is the maximum continuation budget. In live
+runs, matched-baseline continuations are only issued for frontier bursts that
+survive SSoT verification and reachable-cell filtering.
+
 The live benchmark report writes `evidence.hypothesis_test.rejects_null` as a
 boolean. A `false` value is a valid empirical result and should be reported, not
 suppressed.
@@ -322,7 +326,7 @@ Verbose benchmark logs intentionally report both global and local progress:
 ```text
 Benchmark plan: 12 fields × 1 repetitions = 12 runs, 36 planned LLM calls, 3 calls/run.
 Benchmark run 6/12 | field 6/12 city-forget | repetition 1/1 | completed_llm=15/36 | this_run_calls=3
-benchmark run 6/12 field=city-forget | Plan: 3 LLM calls = 1 baseline + 1 frontier bursts + 1 matched-baseline continuation, concurrency=24.
+benchmark run 6/12 field=city-forget | Plan: up to 3 LLM calls = 1 baseline + 1 frontier bursts + up to 1 matched-baseline continuation, concurrency=24.
 benchmark run 6/12 field=city-forget | LLM 16/36 | local LLM 1/3 baseline 1/1 plain started
 Still running after 5.0s | stage=benchmark run 6/12 field 6/12 city-forget; LLM 15/36; baseline 0/2; bursts 0/1 | inflight=benchmark run 6/12 field=city-forget LLM 16/36 baseline 1/1 5.0s
 ```
@@ -336,11 +340,11 @@ field and repetition.
 
 No evidence-grade benchmark trace is reported yet. Evidence runs require the
 calibration path described in `docs/validation_protocol.md`; diagnostic traces
-must not be cited as evidence. The current blocker is operational rather than
-statistical: the evidence profile requires embedding-backed descriptors and a
-large reasoning-model run, while the CLI does not yet configure a production
-embedding provider and the planned call count is intentionally gated as
-expensive.
+must not be cited as evidence. The current blocker is execution, not wiring:
+the CLI now uses `gemini_ex` with `gemini-embedding-001` for embedding-backed
+descriptors, but the evidence run has not been executed and requires live
+Gemini or Vertex embedding credentials plus an intentionally expensive
+reasoning-model call budget.
 
 The stubbed positive control must pass before interpreting a live benchmark:
 
@@ -354,11 +358,26 @@ Cited benchmark numbers must use the evidence profile:
 mix anti_agents.benchmark \
   --profile priv/profiles/evidence.json \
   --fields priv/benchmarks/fields_v1.json \
+  --expensive \
   --out tmp/anti_agents_evidence.json
 ```
 
 Profile values provide defaults and CLI flags override them. Overrides are
 recorded in the trace under `run.profile_overrides`.
+
+The evidence profile defaults to:
+
+```json
+{
+  "distance": "embedding",
+  "embedding_model": "gemini-embedding-001",
+  "embedding_task_type": "clustering",
+  "embedding_dimensions": 768
+}
+```
+
+Set `GEMINI_API_KEY` or the Vertex credentials supported by `gemini_ex` before
+running it live.
 
 ## Mechanism
 
@@ -511,6 +530,10 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
 | `bootstrap_resamples` | `2000` | percentile bootstrap resamples for hypothesis test |
 | `baseline_retry_budget` | `2` | retries for rejected baseline artefacts |
 | `distance` | `:jaccard` | `:jaccard`, `:embedding`, or `:judge` |
+| `embedding_client` | unset in API, Gemini in CLI | module implementing `embed/2`; CLI uses `AntiAgents.Embedding.GeminiClient` when `--distance embedding` |
+| `embedding_model` | `"gemini-embedding-001"` | Gemini embedding model used by the production adapter |
+| `embedding_task_type` | `:clustering` | Gemini embedding task type for descriptor clustering |
+| `embedding_dimensions` | `768` | Gemini output dimensionality; non-3072 vectors are normalized before use |
 | `frontier_temperature_sweep` | `[]` | optional round-robin temperatures for frontier bursts |
 | `coordinate` | `[length: 32, chunk: 5]` | seed length and chunk size |
 | `thinking_budget` | `1200` | `max_tokens` forwarded to the model |
@@ -601,7 +624,8 @@ overall = 0.50 × baseline_distance
 The distance backend is pluggable:
 
 - `jaccard` — lexical token-set Jaccard; transparent and default for local QC.
-- `embedding` — cosine similarity over vectors from an injected embedding client.
+- `embedding` — cosine similarity over vectors from an injected embedding
+  client; CLI evidence runs use `gemini_ex` batch embeddings by default.
 - `judge` — explicit LLM-as-judge path; returns an error unless a judge client is
   configured.
 
@@ -609,12 +633,13 @@ Near-duplicate detection uses a similarity threshold of `0.91`.
 
 Descriptor cells are buckets over
 `{length, sentence_count, affect, abstraction, semantic_cluster}` used for
-archive-membership testing. With `--distance embedding` and a configured
-embedding client, `semantic_cluster` is an integer assigned by nearest fitted
-centroid from the reachable baseline archive. Without embeddings it explicitly
-degrades to `:unknown`, which is diagnostic rather than evidence-grade. Seed
-coverage is deliberately excluded from cell identity; including it would allow
-SSoT outputs to appear novel merely because baselines carry no mapping trace.
+archive-membership testing. With `--distance embedding`, the CLI configures
+`AntiAgents.Embedding.GeminiClient`, calls `gemini_ex` batch embeddings, and
+assigns integer `semantic_cluster` values by nearest fitted centroid from the
+reachable baseline archive. Without embeddings it explicitly degrades to
+`:unknown`, which is diagnostic rather than evidence-grade. Seed coverage is
+deliberately excluded from cell identity; including it would allow SSoT outputs
+to appear novel merely because baselines carry no mapping trace.
 
 ## CLI
 
@@ -632,7 +657,10 @@ mix anti_agents.frontier "the memory of a color that doesn't exist" \
   --matched-budget \
   --bootstrap-resamples 2000 \
   --baseline-retry-budget 2 \
-  --distance jaccard \
+  --distance embedding \
+  --embedding-model gemini-embedding-001 \
+  --embedding-task-type clustering \
+  --embedding-dimensions 768 \
   --toward "machine pastoral" \
   --away-from "standard sci-fi" \
   --preview-chars 180 \
@@ -666,9 +694,10 @@ mix anti_agents.benchmark \
 Benchmark verbose output reports the global benchmark run number, field number,
 overall completed LLM calls, local field-level call count, active stage purpose,
 in-flight heartbeat state, and truncated prompt/output previews. A repeated
-`Plan: 3 LLM calls` line is therefore not a new benchmark total; it is the
-local plan for the current field/repetition and is prefixed with
-`benchmark run X/Y field=...` to make that explicit.
+`Plan: up to 3 LLM calls` line is therefore not a new benchmark total; it is
+the local maximum plan for the current field/repetition and is prefixed with
+`benchmark run X/Y field=...` to make that explicit. The actual local total can
+be lower if frontier bursts are rejected before matched-baseline continuation.
 
 ## Anti-collapse policy
 
@@ -699,10 +728,11 @@ These descriptors suffice for verifying pipeline behaviour but do not substitute
 for NoveltyBench's full evaluation protocol or for a learned behaviour
 descriptor.
 
-**Distance quality.** Distance is pluggable, but the default benchmark path
-still uses lexical Jaccard because it is transparent and cheap. Embedding and
-judge backends exist as explicit paths, but cited results should state which
-backend was used and whether provider-specific embeddings were configured.
+**Distance quality.** Distance is pluggable, and the evidence profile uses
+Gemini embeddings through `gemini_ex`. The default local path still uses lexical
+Jaccard because it is transparent and cheap. Cited results should state the
+backend, embedding model, task type, dimensionality, and whether Gemini API or
+Vertex authentication was used.
 
 **Descriptor ceiling.** The benchmark reports `empirical_cell_space`,
 `saturation`, `cell_saturation_warning`, and benchmark-level

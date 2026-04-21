@@ -28,6 +28,8 @@ defmodule AntiAgents.MixProject do
   defp deps do
     [
       {:codex_sdk, "~> 0.16"},
+      {:gemini_ex, "~> 0.13.0"},
+      {:telemetry, "~> 1.3.0", override: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}
