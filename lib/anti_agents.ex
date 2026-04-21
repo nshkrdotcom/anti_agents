@@ -192,6 +192,113 @@ defmodule AntiAgents.Client do
   @callback complete(String.t(), keyword()) :: {:ok, any()} | {:error, any()}
 end
 
+defmodule AntiAgents.CodexConfig do
+  @moduledoc false
+
+  @default_model "gpt-5.4-mini"
+  @default_reasoning_effort :low
+
+  def default_model, do: @default_model
+  def default_reasoning_effort, do: @default_reasoning_effort
+
+  def model(opts) do
+    opts
+    |> get_option(:model)
+    |> fallback(fetch_codex_opt(opts, :model))
+    |> fallback(@default_model)
+  end
+
+  def reasoning_effort(opts) do
+    opts
+    |> get_option(:reasoning_effort)
+    |> fallback(fetch_codex_opt(opts, :reasoning_effort))
+    |> fallback(fetch_codex_opt(opts, :reasoning))
+    |> fallback(@default_reasoning_effort)
+    |> normalize_reasoning_effort()
+  end
+
+  def codex_opts(opts) when is_list(opts) do
+    base = opts |> Keyword.get(:codex_opts, []) |> normalize_keyword()
+
+    if Keyword.has_key?(base, :model_payload) do
+      base
+    else
+      base
+      |> Keyword.drop([:model, :reasoning, :reasoning_effort])
+      |> Keyword.put(:model_payload, model_payload(model(opts), reasoning_effort(opts)))
+    end
+  end
+
+  def model_payload(model, effort) do
+    %{
+      provider: :codex,
+      requested_model: model,
+      resolved_model: model,
+      reasoning: Atom.to_string(effort),
+      reasoning_effort: nil,
+      normalized_reasoning_effort: nil
+    }
+  end
+
+  def temperature_config_overrides(opts) do
+    [{"temperature", AntiAgents.Prompt.response_temperature(opts)}]
+  end
+
+  def merge_config_overrides(opts, turn_opts) do
+    turn_opts
+    |> Map.get(:config_overrides, Map.get(turn_opts, "config_overrides", []))
+    |> List.wrap()
+    |> Kernel.++(get_option(opts, :config_overrides) |> List.wrap())
+    |> Kernel.++(temperature_config_overrides(opts))
+  end
+
+  def normalize_reasoning_effort(value) when is_atom(value), do: value
+
+  def normalize_reasoning_effort(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+    |> String.to_atom()
+  end
+
+  def normalize_reasoning_effort(_value), do: @default_reasoning_effort
+
+  defp fetch_codex_opt(opts, key) do
+    opts
+    |> get_option(:codex_opts)
+    |> case do
+      nil -> nil
+      codex_opts -> codex_opts |> normalize_keyword() |> Keyword.get(key)
+    end
+  end
+
+  defp normalize_keyword(nil), do: []
+  defp normalize_keyword(opts) when is_list(opts), do: normalize_keyword_keys(opts)
+
+  defp normalize_keyword(opts) when is_map(opts),
+    do: opts |> Map.to_list() |> normalize_keyword_keys()
+
+  defp normalize_keyword(_opts), do: []
+
+  defp normalize_keyword_keys(opts) do
+    Enum.map(opts, fn
+      {key, value} when is_binary(key) -> {String.to_atom(key), value}
+      pair -> pair
+    end)
+  end
+
+  defp get_option(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+
+  defp get_option(opts, key) when is_map(opts),
+    do: Map.get(opts, key, Map.get(opts, Atom.to_string(key)))
+
+  defp get_option(_opts, _key), do: nil
+
+  defp fallback(nil, value), do: value
+  defp fallback("", value), do: value
+  defp fallback(value, _fallback), do: value
+end
+
 defmodule AntiAgents.CodexClient do
   @moduledoc """
   Default codex_sdk-backed provider for burst and baseline generation.
@@ -201,13 +308,14 @@ defmodule AntiAgents.CodexClient do
 
   @impl true
   def complete(prompt, opts) when is_binary(prompt) and is_list(opts) do
+    codex_module = Keyword.get(opts, :codex_module, Codex)
+    agent_module = Keyword.get(opts, :agent_module, Codex.Agent)
+    run_config_module = Keyword.get(opts, :run_config_module, Codex.RunConfig)
+    agent_runner_module = Keyword.get(opts, :agent_runner_module, Codex.AgentRunner)
     options_module = Keyword.get(opts, :options_module, Codex.Options)
     thread_options_module = Keyword.get(opts, :thread_options_module, Codex.Thread.Options)
 
-    codex_opts =
-      Keyword.get(opts, :codex_opts, [])
-      |> Keyword.put_new(:model, Keyword.get(opts, :model))
-
+    codex_opts = AntiAgents.CodexConfig.codex_opts(opts)
     thread_opts = Keyword.get(opts, :thread_opts, [])
     run_config_opts = Keyword.get(opts, :run_config, [])
     agent_opts = Keyword.get(opts, :agent, [])
@@ -238,13 +346,28 @@ defmodule AntiAgents.CodexClient do
         tracing_disabled: Map.get(run_config_map, :tracing_disabled, false)
       })
 
+    output_schema = Keyword.get(opts, :output_schema)
+    base_turn_opts = opts |> Keyword.get(:turn_opts, %{}) |> normalize_struct_or_map()
+
+    turn_opts =
+      base_turn_opts
+      |> maybe_put(:output_schema, output_schema)
+      |> Map.put(
+        :config_overrides,
+        AntiAgents.CodexConfig.merge_config_overrides(opts, base_turn_opts)
+      )
+
     with {:ok, codex_opts} <- options_module.new(codex_opts),
          {:ok, thread_opts} <- thread_options_module.new(thread_opts),
-         {:ok, agent} <- Codex.Agent.new(agent_attrs),
-         {:ok, run_config} <- Codex.RunConfig.new(run_config_attrs),
-         {:ok, thread} <- Codex.start_thread(codex_opts, thread_opts),
+         {:ok, agent} <- agent_module.new(agent_attrs),
+         {:ok, run_config} <- run_config_module.new(run_config_attrs),
+         {:ok, thread} <- codex_module.start_thread(codex_opts, thread_opts),
          {:ok, result} <-
-           Codex.AgentRunner.run(thread, input, %{agent: agent, run_config: run_config}) do
+           agent_runner_module.run(thread, input, %{
+             agent: agent,
+             run_config: run_config,
+             turn_opts: turn_opts
+           }) do
       AntiAgents.Scoring.extract_text(result)
     end
   end
@@ -258,6 +381,9 @@ defmodule AntiAgents.CodexClient do
   defp model_settings_from(list) when is_list(list), do: Keyword.get(list, :model_settings)
   defp model_settings_from(map) when is_map(map), do: Map.get(map, :model_settings)
   defp model_settings_from(_), do: nil
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp default_trace_id do
     "anti-agents-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -276,16 +402,17 @@ defmodule AntiAgents.Prompt do
     """
     You are not a persona. Produce exactly one exploration.
 
-    1. Emit <random_string>...</random_string>.
+    1. Internally generate a fresh random string, then emit it as random_string.
     2. Prefer a single JSON object with keys:
-       - random_string: the exact seed string
+       - random_string: the exact internally generated random string
        - mapping: an object with a decisions array
        - answer: the final answer text
        The mapping.decisions entries should include chunk-local decisions across the axes.
-       Split the seed into fixed-size chunks of #{chunk_size} and use these axes: #{axes}.
+       Split random_string into fixed-size chunks of #{chunk_size} and use these axes: #{axes}.
     3. No markdown, no code fences, and no commentary outside the JSON object.
 
     Rules:
+    - Do not copy the coordinate nonce as random_string.
     - Use multiple chunks in local decisions, not one global theme choice.
     - Do not use only the first character or first chunk.
     - No tool calls.
@@ -306,7 +433,7 @@ defmodule AntiAgents.Prompt do
     chunk_size = get_coordinate(opts, :chunk, 5)
 
     """
-    Seed string: #{seed}
+    Coordinate nonce: #{seed}
     Field prompt: #{field.prompt}
     Axes: #{Enum.map_join(field.axes, ", ", &to_string/1)}
     Chunk size: #{chunk_size}
@@ -341,6 +468,7 @@ defmodule AntiAgents.Prompt do
     heat = get_option(opts, :heat)
 
     cond do
+      is_number(heat) -> heat
       is_list(heat) -> Keyword.get(heat, :answer, 1.0)
       is_map(heat) -> Map.get(heat, :answer, 1.0)
       true -> 1.0
@@ -363,7 +491,7 @@ defmodule AntiAgents.Prompt do
 
   def run_config(opts) do
     max_turns = get_option(opts, :max_turns) || 1
-    model = get_option(opts, :model)
+    model = get_option(opts, :run_config_model)
     workflow = get_option(opts, :workflow) || "anti_agents"
     group = get_option(opts, :group) || "frontier"
     trace_id = get_option(opts, :trace_id) || default_trace_id()
@@ -441,13 +569,13 @@ defmodule AntiAgents.Prompt do
                   "chunk" => %{"type" => "integer"},
                   "value" => %{"type" => "string"}
                 },
-                "required" => ["axis", "chunk"],
-                "additionalProperties" => true
+                "required" => ["axis", "chunk", "value"],
+                "additionalProperties" => false
               }
             }
           },
           "required" => ["decisions"],
-          "additionalProperties" => true
+          "additionalProperties" => false
         },
         "answer" => %{"type" => "string"}
       },
@@ -531,7 +659,11 @@ defmodule AntiAgents.Scoring do
   def seed_coverage(mapping, chunk_count) do
     used_chunks = parse_mapping_coverage(mapping).chunk_count
     denom = max(1, chunk_count)
-    Float.round(used_chunks / denom, 3)
+
+    used_chunks
+    |> Kernel./(denom)
+    |> min(1.0)
+    |> Float.round(3)
   end
 
   def score(candidate, reachable, frontier) do
@@ -650,12 +782,7 @@ defmodule AntiAgents.Scoring do
   defp parse_json_output(output) do
     case Jason.decode(String.trim(output)) do
       {:ok, %{"random_string" => random_string, "mapping" => mapping, "answer" => answer}} ->
-        {:ok,
-         %{
-           random_string: String.trim(random_string),
-           mapping: mapping,
-           answer: String.trim(answer)
-         }}
+        normalize_parsed_json(random_string, mapping, answer)
 
       {:ok, _other} ->
         {:error, :not_structured_json}
@@ -663,6 +790,34 @@ defmodule AntiAgents.Scoring do
       {:error, _reason} ->
         {:error, :not_json}
     end
+  end
+
+  defp normalize_parsed_json(random_string, mapping, answer) when is_binary(answer) do
+    answer
+    |> String.trim()
+    |> Jason.decode()
+    |> case do
+      {:ok,
+       %{"random_string" => nested_random, "mapping" => nested_mapping, "answer" => nested_answer}} ->
+        normalize_parsed_json(nested_random, nested_mapping, nested_answer)
+
+      _other ->
+        {:ok,
+         %{
+           random_string: String.trim(to_string(random_string)),
+           mapping: mapping,
+           answer: String.trim(answer)
+         }}
+    end
+  end
+
+  defp normalize_parsed_json(random_string, mapping, answer) do
+    {:ok,
+     %{
+       random_string: String.trim(to_string(random_string)),
+       mapping: mapping,
+       answer: String.trim(to_string(answer))
+     }}
   end
 
   defp hash_token(value) do
@@ -800,14 +955,14 @@ defmodule AntiAgents.Bursts do
     options = default_burst_options(opts)
     client = Keyword.get(options, :client, CodexClient)
     seed = get_seed(options)
-    chunk_count = chunk_count(seed, get_coordinate(options, :chunk, 5))
+    chunk_size = get_coordinate(options, :chunk, 5)
 
     prompt = Prompt.burst_prompt(field, options)
     input = Prompt.field_input(field, options)
 
     case client.complete(prompt, completion_opts(field, prompt, input, options)) do
       {:ok, raw} ->
-        burst_from_raw(field, seed, chunk_count, raw)
+        burst_from_raw(field, seed, chunk_size, raw)
 
       {:error, reason} ->
         provider_error_burst(field, seed, reason)
@@ -849,8 +1004,14 @@ defmodule AntiAgents.Bursts do
     Keyword.merge(
       [
         input: input,
+        model: Keyword.get(opts, :model, AntiAgents.CodexConfig.default_model()),
+        reasoning_effort:
+          Keyword.get(opts, :reasoning_effort, AntiAgents.CodexConfig.default_reasoning_effort()),
+        codex_opts: Keyword.get(opts, :codex_opts, []),
+        thread_opts: Keyword.get(opts, :thread_opts, []),
         model_settings: Keyword.get(opts, :model_settings, Prompt.model_settings(opts)),
         run_config: Prompt.run_config(opts),
+        turn_opts: turn_opts(opts),
         agent: [instructions: prompt],
         output_schema: Prompt.output_schema(opts)
       ],
@@ -858,14 +1019,24 @@ defmodule AntiAgents.Bursts do
     )
   end
 
-  defp burst_from_raw(field, seed, chunk_count, raw) do
+  defp turn_opts(opts) do
+    [
+      timeout_ms: Keyword.get(opts, :timeout_ms),
+      stream_idle_timeout_ms: Keyword.get(opts, :stream_idle_timeout_ms)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp burst_from_raw(field, seed, chunk_size, raw) do
     {:ok, text} = Scoring.extract_text(raw)
 
     case Scoring.parse_burst_output(text) do
       {:ok, parsed} ->
+        chunk_count = chunk_count(parsed.random_string, chunk_size)
         structured_burst(field, seed, chunk_count, text, parsed)
 
       {:error, reason} ->
+        chunk_count = chunk_count(seed, chunk_size)
         unstructured_burst(field, seed, chunk_count, text, reason)
     end
   end
@@ -886,7 +1057,7 @@ defmodule AntiAgents.Bursts do
       }
       |> Map.put(:seed_coverage, Scoring.seed_coverage(mapping, chunk_count))
 
-    descriptor = Scoring.descriptor(base.answer, mapping, base.seed, chunk_count)
+    descriptor = Scoring.descriptor(base.answer, mapping, base.random_string, chunk_count)
     candidate = Scoring.enrich(base, descriptor, base.seed_coverage)
 
     maybe_reject_candidate(candidate, mapping, chunk_count)
@@ -965,7 +1136,9 @@ defmodule AntiAgents.Bursts do
       codex_opts: [],
       thread_opts: [],
       client_opts: [],
-      max_turns: 1
+      max_turns: 1,
+      model: AntiAgents.CodexConfig.default_model(),
+      reasoning_effort: AntiAgents.CodexConfig.default_reasoning_effort()
     ]
 
     defaults
@@ -1141,13 +1314,27 @@ defmodule AntiAgents.Frontier do
     Keyword.merge(
       [
         input: input,
+        model: Keyword.get(opts, :model, AntiAgents.CodexConfig.default_model()),
+        reasoning_effort:
+          Keyword.get(opts, :reasoning_effort, AntiAgents.CodexConfig.default_reasoning_effort()),
+        codex_opts: Keyword.get(opts, :codex_opts, []),
+        thread_opts: Keyword.get(opts, :thread_opts, []),
         model_settings: Keyword.get(opts, :model_settings, Prompt.model_settings(opts)),
         run_config: Prompt.run_config(opts),
+        turn_opts: turn_opts(opts),
         agent: [instructions: prompt],
         output_schema: Prompt.output_schema(opts)
       ],
       Keyword.get(opts, :client_opts, [])
     )
+  end
+
+  defp turn_opts(opts) do
+    [
+      timeout_ms: Keyword.get(opts, :timeout_ms),
+      stream_idle_timeout_ms: Keyword.get(opts, :stream_idle_timeout_ms)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   defp frontier_cell_hit?(_burst, []), do: false
