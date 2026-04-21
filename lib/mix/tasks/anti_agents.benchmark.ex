@@ -9,8 +9,10 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
 
   @switches [
     fields: :string,
+    profile: :string,
     out: :string,
     dry_run: :boolean,
+    diagnostic: :boolean,
     expensive: :boolean,
     branching: :integer,
     repetitions: :integer,
@@ -21,6 +23,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     model: :string,
     reasoning: :string,
     temperature: :float,
+    frontier_temperature_sweep: :string,
     bootstrap_resamples: :integer,
     baseline_retry_budget: :integer,
     heartbeat_ms: :integer,
@@ -51,9 +54,13 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
 
     Options:
       --dry-run                 print benchmark plan without provider calls
+      --profile PATH            load evidence profile defaults
+      --diagnostic              allow low-budget diagnostic runs; not evidence
       --branching N             frontier bursts per field/repetition, default 8
       --repetitions N           repetitions per field, default 3
       --baseline LIST           plain,paraphrase,seed_injection,temp:0.8|1.0|1.2
+      --frontier-temperature-sweep LIST
+                                round-robin frontier temperatures, e.g. 1.0|1.1|1.2
       --bootstrap-resamples N   default 2000
       --heartbeat-ms N          verbose heartbeat interval, default 5000
       --preview-chars N         chars of prompt/output preview, default 180
@@ -64,29 +71,41 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
 
   defp normalize_opts(opts) do
     fields = Keyword.get(opts, :fields) || Mix.raise("--fields is required")
+    profile_path = Keyword.get(opts, :profile)
+    profile = load_profile(profile_path)
 
     %{
       fields_path: fields,
+      profile_path: profile_path,
+      profile_id: Map.get(profile, "id"),
+      profile_overrides: profile_overrides(opts, profile),
       out: Keyword.get(opts, :out),
       dry_run: Keyword.get(opts, :dry_run, false),
+      diagnostic: Keyword.get(opts, :diagnostic, false),
       expensive: Keyword.get(opts, :expensive, false),
-      branching: Keyword.get(opts, :branching, 8),
-      repetitions: Keyword.get(opts, :repetitions, 3),
+      branching: option(opts, profile, :branching, 8),
+      repetitions: option(opts, profile, :repetitions, 3),
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
-      rounds: Keyword.get(opts, :rounds, 1),
-      distance: Keyword.get(opts, :distance, "jaccard"),
-      baseline: parse_baseline(Keyword.get(opts, :baseline)),
-      model: Keyword.get(opts, :model, AntiAgents.CodexConfig.default_model()),
+      rounds: option(opts, profile, :rounds, 1),
+      distance: option(opts, profile, :distance, "jaccard"),
+      baseline: parse_baseline(option(opts, profile, :baseline, nil)),
+      model: option(opts, profile, :model, AntiAgents.CodexConfig.default_model()),
       reasoning_effort:
         opts
-        |> Keyword.get(:reasoning, AntiAgents.CodexConfig.default_reasoning_effort())
+        |> Keyword.get(
+          :reasoning,
+          Map.get(profile, "reasoning_effort", AntiAgents.CodexConfig.default_reasoning_effort())
+        )
         |> AntiAgents.CodexConfig.normalize_reasoning_effort(),
-      temperature: Keyword.get(opts, :temperature, 1.05),
-      bootstrap_resamples: Keyword.get(opts, :bootstrap_resamples, 2_000),
+      temperature: option(opts, profile, :temperature, 1.05),
+      frontier_temperature_sweep:
+        parse_temperature_sweep(option(opts, profile, :frontier_temperature_sweep, nil)),
+      bootstrap_resamples: option(opts, profile, :bootstrap_resamples, 2_000),
       baseline_retry_budget: Keyword.get(opts, :baseline_retry_budget, 2),
       heartbeat_ms: Keyword.get(opts, :heartbeat_ms, 5_000),
       preview_chars: Keyword.get(opts, :preview_chars, 180),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
+      thinking_budget: option(opts, profile, :thinking_budget, 1200),
       verbose: Keyword.get(opts, :verbose, false)
     }
   end
@@ -98,12 +117,16 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     frontier_calls = config.branching * config.rounds
     calls_per_run = baseline_calls + frontier_calls + frontier_calls
     planned_llm_calls = length(fields) * config.repetitions * calls_per_run
+    validate_budget!(config)
 
     if config.dry_run do
       emit(
         %{
           "schema_version" => 1,
-          "mode" => "benchmark_dry_run",
+          "mode" => benchmark_mode(config),
+          "dry_run" => true,
+          "diagnostic" => config.diagnostic,
+          "run" => run_summary(config),
           "fields_path" => config.fields_path,
           "fields_sha256" => fields_sha256,
           "field_count" => length(fields),
@@ -113,7 +136,9 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
           "matched_baseline_calls_per_run" => frontier_calls,
           "planned_llm_calls" => planned_llm_calls,
           "distance" => config.distance,
-          "rounds" => config.rounds
+          "rounds" => config.rounds,
+          "frontier_temperature_points" => frontier_temperature_points(config),
+          "matched_baseline_temperature_points" => matched_baseline_temperature_points(config)
         },
         config
       )
@@ -140,17 +165,24 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
         end)
 
       hypothesis = aggregate_hypothesis(reports, config)
+      pooled_hypothesis = pooled_hypothesis(reports, config)
 
       emit(
         %{
           "schema_version" => 1,
-          "mode" => "benchmark_report",
+          "mode" => benchmark_mode(config),
+          "diagnostic" => config.diagnostic,
+          "run" => run_summary(config),
           "fields_path" => config.fields_path,
           "fields_sha256" => fields_sha256,
           "field_count" => length(fields),
           "repetitions" => config.repetitions,
           "planned_llm_calls" => planned_llm_calls,
-          "evidence" => %{"hypothesis_test" => hypothesis},
+          "evidence" => %{
+            "hypothesis_test" => hypothesis,
+            "pooled_hypothesis_test" => pooled_hypothesis,
+            "calibration_status" => calibration_status(reports)
+          },
           "runs" => Enum.map(reports, &benchmark_run_trace/1)
         },
         config
@@ -158,10 +190,38 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     end
   end
 
+  defp validate_budget!(%{branching: branching, diagnostic: false}) when branching < 4 do
+    Mix.raise(
+      "--branching #{branching} is diagnostic-only. Use --branching >= 4 for benchmark reports or pass --diagnostic to mark the output as non-evidence."
+    )
+  end
+
+  defp validate_budget!(_config), do: :ok
+
+  defp benchmark_mode(%{diagnostic: true}), do: "benchmark_diagnostic"
+  defp benchmark_mode(%{dry_run: true}), do: "benchmark_dry_run"
+  defp benchmark_mode(_config), do: "benchmark_report"
+
   defp benchmark_run_trace(%{field_id: field_id, repetition: repetition, trace: trace}) do
     trace
     |> Map.put("field_id", field_id)
     |> Map.put("repetition", repetition)
+  end
+
+  defp run_summary(config) do
+    %{
+      "profile_id" => config.profile_id,
+      "profile_path" => config.profile_path,
+      "profile_overrides" => config.profile_overrides,
+      "model" => config.model,
+      "reasoning_effort" => Atom.to_string(config.reasoning_effort),
+      "thinking_budget" => config.thinking_budget,
+      "branching" => config.branching,
+      "repetitions" => config.repetitions,
+      "distance" => config.distance,
+      "frontier_temperature_points" => frontier_temperature_points(config),
+      "matched_baseline_temperature_points" => matched_baseline_temperature_points(config)
+    }
   end
 
   defp run_reports(fields, config, progress_opts, calls_per_run, planned_llm_calls) do
@@ -219,6 +279,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       [
         branching: ctx.config.branching,
         baseline: ctx.config.baseline,
+        matched_baseline_methods: matched_baseline_methods(ctx.config),
         matched_budget: true,
         bootstrap_resamples: ctx.config.bootstrap_resamples,
         baseline_retry_budget: ctx.config.baseline_retry_budget,
@@ -227,8 +288,12 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
         distance: parse_distance(ctx.config.distance),
         timeout_ms: ctx.config.timeout_ms,
         preview_chars: ctx.config.preview_chars,
+        frontier_temperature_sweep: ctx.config.frontier_temperature_sweep,
         model: ctx.config.model,
         reasoning_effort: ctx.config.reasoning_effort,
+        thinking_budget: ctx.config.thinking_budget,
+        profile_id: ctx.config.profile_id,
+        profile_overrides: ctx.config.profile_overrides,
         verbose: ctx.config.verbose,
         progress_state: Keyword.get(ctx.progress_opts, :progress_state),
         heat: [answer: ctx.config.temperature]
@@ -263,6 +328,28 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
   end
 
   defp aggregate_hypothesis(reports, config) do
+    deltas = Enum.map(reports, &AntiAgents.Statistics.per_field_delta(&1.report))
+
+    mean_ci =
+      AntiAgents.Statistics.mean_delta_ci(deltas, resamples: config.bootstrap_resamples, seed: 41)
+
+    sign_test = AntiAgents.Statistics.sign_test(deltas)
+    lower_bound = hd(mean_ci.bootstrap_ci_95)
+
+    %{
+      aggregation: "per_field",
+      delta_observations: deltas,
+      mean_delta: mean_ci.mean_delta,
+      bootstrap_ci_95: mean_ci.bootstrap_ci_95,
+      sign_test_p: sign_test.p_value,
+      sign_test: sign_test,
+      rejects_null: lower_bound > 0 and sign_test.p_value < 0.05,
+      n_observations: mean_ci.n_observations,
+      n_resamples: config.bootstrap_resamples
+    }
+  end
+
+  defp pooled_hypothesis(reports, config) do
     frontier = reports |> Enum.flat_map(& &1.report.exemplars)
     matched = reports |> Enum.flat_map(& &1.report.matched_baseline_archive)
 
@@ -270,6 +357,19 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
       resamples: config.bootstrap_resamples,
       seed: 41
     )
+  end
+
+  defp calibration_status(reports) do
+    saturated =
+      Enum.count(reports, fn run ->
+        Map.get(run.report.metrics, :cell_saturation_warning, false)
+      end)
+
+    if reports != [] and saturated / length(reports) > 0.3 do
+      "descriptor_saturated"
+    else
+      "ok"
+    end
   end
 
   defp emit(data, config) do
@@ -281,6 +381,40 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
         AntiAgents.Trace.write_json!(path, data)
         Mix.shell().info("Wrote AntiAgents benchmark trace to #{path}")
     end
+  end
+
+  defp load_profile(nil), do: %{}
+
+  defp load_profile(path) do
+    path
+    |> File.read!()
+    |> Jason.decode!()
+  end
+
+  defp option(opts, profile, key, default) do
+    Keyword.get(opts, key, Map.get(profile, Atom.to_string(key), default))
+  end
+
+  defp profile_overrides(_opts, profile) when profile == %{}, do: %{}
+
+  defp profile_overrides(opts, profile) do
+    profile_keys = profile |> Map.keys() |> MapSet.new()
+
+    opts
+    |> Enum.flat_map(fn
+      {:reasoning, value} ->
+        if MapSet.member?(profile_keys, "reasoning_effort"),
+          do: [{"reasoning_effort", value}],
+          else: []
+
+      {key, value} ->
+        profile_key = Atom.to_string(key)
+
+        if MapSet.member?(profile_keys, profile_key),
+          do: [{profile_key, value}],
+          else: []
+    end)
+    |> Map.new()
   end
 
   defp read_fields!(path) do
@@ -312,6 +446,22 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
   defp parse_baseline(nil),
     do: [:plain, :paraphrase, {:temperature, [0.8, 1.0, 1.2]}, :seed_injection]
 
+  defp parse_baseline(methods) when is_list(methods) do
+    Enum.flat_map(methods, fn
+      method when is_binary(method) ->
+        parse_baseline_entry(method)
+
+      %{"temperature" => temps} when is_list(temps) ->
+        [{:temperature, Enum.map(temps, &(&1 * 1.0))}]
+
+      other when is_atom(other) ->
+        [other]
+
+      _other ->
+        []
+    end)
+  end
+
   defp parse_baseline(text) when is_binary(text) do
     text
     |> String.split(",", trim: true)
@@ -327,6 +477,31 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
 
   defp parse_temps(temps),
     do: temps |> String.split("|", trim: true) |> Enum.map(&String.to_float/1)
+
+  defp parse_temperature_sweep(nil), do: []
+  defp parse_temperature_sweep(""), do: []
+  defp parse_temperature_sweep(values) when is_list(values), do: Enum.map(values, &(&1 * 1.0))
+  defp parse_temperature_sweep(text), do: parse_temps(text)
+
+  defp frontier_temperature_points(%{frontier_temperature_sweep: []} = config),
+    do: [config.temperature]
+
+  defp frontier_temperature_points(config), do: config.frontier_temperature_sweep
+
+  defp matched_baseline_methods(%{frontier_temperature_sweep: []} = config),
+    do: [{:temperature, [config.temperature]}]
+
+  defp matched_baseline_methods(config), do: config.baseline
+
+  defp matched_baseline_temperature_points(config) do
+    config
+    |> matched_baseline_methods()
+    |> Enum.flat_map(fn
+      {:temperature, temps} when is_list(temps) -> temps
+      {:temperature, temp} when is_number(temp) -> [temp]
+      _method -> []
+    end)
+  end
 
   defp parse_distance("embedding"), do: :embedding
   defp parse_distance("judge"), do: :judge

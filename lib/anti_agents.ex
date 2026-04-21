@@ -177,7 +177,13 @@ defmodule AntiAgents.FrontierReport do
     baseline_loss_adjustment: 0.0,
     matched_baseline_archive: [],
     matched_baseline_cell_count: 0,
+    matched_baseline_retry_count: 0,
+    matched_baseline_permanent_loss_count: 0,
+    matched_baseline_loss_adjustment: 0.0,
+    adjusted_matched_baseline_cell_count: 0.0,
     hypothesis_test: %{},
+    semantic_descriptor_status: :unknown,
+    semantic_centroid_ids: [],
     rounds: 1,
     round_summaries: [],
     stagnation_at_round: nil,
@@ -204,7 +210,13 @@ defmodule AntiAgents.FrontierReport do
           baseline_loss_adjustment: float(),
           matched_baseline_archive: [AntiAgents.BurstResult.t()],
           matched_baseline_cell_count: non_neg_integer(),
+          matched_baseline_retry_count: non_neg_integer(),
+          matched_baseline_permanent_loss_count: non_neg_integer(),
+          matched_baseline_loss_adjustment: float(),
+          adjusted_matched_baseline_cell_count: float(),
           hypothesis_test: map(),
+          semantic_descriptor_status: atom(),
+          semantic_centroid_ids: [String.t()],
           rounds: pos_integer(),
           round_summaries: [map()],
           stagnation_at_round: pos_integer() | nil,
@@ -218,7 +230,10 @@ defmodule AntiAgents.FrontierReport do
             distinct: integer(),
             coherence: float(),
             seed_coverage: float(),
-            archive_coverage: float()
+            archive_coverage: float(),
+            empirical_cell_space: non_neg_integer(),
+            saturation: float(),
+            cell_saturation_warning: boolean()
           }
         }
 end
@@ -672,6 +687,7 @@ defmodule AntiAgents.Scoring do
   @moduledoc false
 
   alias AntiAgents.Distance
+  alias AntiAgents.Distance.Embedding
 
   def extract_text(%{final_response: final_response}), do: extract_text(final_response)
   def extract_text(%{content: text}) when is_binary(text), do: {:ok, text}
@@ -725,11 +741,12 @@ defmodule AntiAgents.Scoring do
     end
   end
 
-  def descriptor(text, mapping, seed, chunk_count, verification \\ nil) do
+  def descriptor(text, mapping, seed, chunk_count, verification \\ nil, opts \\ []) do
     structural = structural_descriptor(text)
     affect = affect_band(text)
     abstraction = abstraction_level(text)
     seed_profile = seed_profile(mapping, seed, chunk_count, verification)
+    semantic_cluster = semantic_cluster(text, opts)
 
     %{
       semantic: semantic_fingerprint(text),
@@ -737,7 +754,8 @@ defmodule AntiAgents.Scoring do
       affect: affect,
       abstraction: abstraction,
       seed_profile: seed_profile,
-      cell: novelty_cell(structural, affect, abstraction, seed_profile)
+      semantic_cluster: semantic_cluster,
+      cell: novelty_cell(structural, affect, abstraction, seed_profile, semantic_cluster)
     }
   end
 
@@ -753,11 +771,30 @@ defmodule AntiAgents.Scoring do
 
   def fit_centroids(vectors, k) when is_list(vectors) and is_integer(k) and k > 0 do
     vectors
-    |> Enum.uniq()
-    |> Enum.take(k)
+    |> normalize_vectors()
+    |> do_fit_centroids(k)
   end
 
   def fit_centroids(_vectors, _k), do: []
+
+  def centroid_ids(centroids) when is_list(centroids) do
+    Enum.map(centroids, fn centroid ->
+      digest = :crypto.hash(:sha256, :erlang.term_to_binary(centroid))
+
+      digest
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+    end)
+  end
+
+  def nearest_centroid_index(vector, centroids) when is_list(vector) and is_list(centroids) do
+    centroids
+    |> Enum.with_index()
+    |> Enum.min_by(fn {centroid, _index} -> euclidean_distance(vector, centroid) end, fn ->
+      {nil, nil}
+    end)
+    |> elem(1)
+  end
 
   def local_hash(_axis, chunk_text, chunk_index) do
     "#{chunk_index}:#{chunk_text}"
@@ -1128,14 +1165,110 @@ defmodule AntiAgents.Scoring do
     |> binary_part(0, 12)
   end
 
-  defp novelty_cell(structural, affect, abstraction, _seed_profile) do
+  defp novelty_cell(structural, affect, abstraction, _seed_profile, semantic_cluster) do
     %{
       length: length_bucket(structural.length),
       sentence_count: sentence_bucket(structural.sentence_count),
       affect: affect,
       abstraction: abstraction,
-      semantic_cluster: :unknown
+      semantic_cluster: semantic_cluster
     }
+  end
+
+  defp semantic_cluster(text, opts) do
+    centroids = Keyword.get(opts, :semantic_centroids, [])
+
+    if centroids == [] do
+      :unknown
+    else
+      case Embedding.embed([text], opts) do
+        {:ok, [vector]} -> nearest_centroid_index(vector, centroids) || :unknown
+        {:error, _reason} -> :unknown
+      end
+    end
+  end
+
+  defp normalize_vectors(vectors) do
+    vectors
+    |> Enum.filter(fn
+      vector when is_list(vector) -> Enum.all?(vector, &is_number/1)
+      _other -> false
+    end)
+    |> Enum.map(&Enum.map(&1, fn value -> value * 1.0 end))
+    |> Enum.uniq()
+  end
+
+  defp do_fit_centroids([], _k), do: []
+
+  defp do_fit_centroids(vectors, k) do
+    k = vectors |> length() |> min(k)
+
+    vectors
+    |> seed_centroids(k)
+    |> iterate_centroids(vectors, 20)
+  end
+
+  defp seed_centroids(vectors, k) when k <= 1, do: [hd(vectors)]
+
+  defp seed_centroids(vectors, k) do
+    Enum.reduce(2..k, [hd(vectors)], fn _step, centroids ->
+      next = farthest_vector(vectors, centroids)
+      if next in centroids, do: centroids, else: centroids ++ [next]
+    end)
+  end
+
+  defp farthest_vector(vectors, centroids) do
+    Enum.max_by(vectors, &nearest_distance(&1, centroids))
+  end
+
+  defp nearest_distance(vector, centroids) do
+    centroids
+    |> Enum.map(&euclidean_distance(vector, &1))
+    |> Enum.min(fn -> 0.0 end)
+  end
+
+  defp iterate_centroids(centroids, _vectors, 0), do: centroids
+
+  defp iterate_centroids(centroids, vectors, remaining) do
+    centroids
+    |> recompute_centroids(vectors)
+    |> iterate_centroids(vectors, remaining - 1)
+  end
+
+  defp recompute_centroids(centroids, vectors) do
+    groups =
+      vectors
+      |> Enum.group_by(&nearest_centroid_index(&1, centroids))
+
+    centroids
+    |> Enum.with_index()
+    |> Enum.map(fn {centroid, index} ->
+      case Map.get(groups, index, []) do
+        [] -> centroid
+        assigned -> mean_vector(assigned)
+      end
+    end)
+  end
+
+  defp mean_vector(vectors) do
+    dimensions = vectors |> hd() |> length()
+    count = length(vectors)
+
+    0..(dimensions - 1)
+    |> Enum.map(fn index ->
+      vectors
+      |> Enum.map(&Enum.at(&1, index, 0.0))
+      |> Enum.sum()
+      |> Kernel./(count)
+    end)
+  end
+
+  defp euclidean_distance(left, right) do
+    left
+    |> Enum.zip(right)
+    |> Enum.map(fn {a, b} -> :math.pow(a - b, 2) end)
+    |> Enum.sum()
+    |> :math.sqrt()
   end
 
   defp length_bucket(n) when n < 80, do: :short
@@ -1380,7 +1513,7 @@ defmodule AntiAgents.Bursts do
 
     case client.complete(prompt, completion_opts(field, prompt, input, options)) do
       {:ok, raw} ->
-        burst = burst_from_raw(field, seed, chunk_size, raw)
+        burst = burst_from_raw(field, seed, chunk_size, raw, options)
 
         Progress.event(options, :burst_call_done, %{
           index: Keyword.get(options, :burst_index),
@@ -1425,6 +1558,7 @@ defmodule AntiAgents.Bursts do
     |> Task.async_stream(
       fn index ->
         burst_opts
+        |> put_frontier_temperature(index)
         |> Keyword.put(:burst_index, index)
         |> Keyword.put(:burst_total, n)
         |> then(&burst(field, &1))
@@ -1486,20 +1620,20 @@ defmodule AntiAgents.Bursts do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
-  defp burst_from_raw(field, seed, chunk_size, raw) do
+  defp burst_from_raw(field, seed, chunk_size, raw, opts) do
     {:ok, text} = Scoring.extract_text(raw)
 
     case Scoring.parse_burst_output(text) do
       {:ok, parsed} ->
         chunk_count = chunk_count(parsed.random_string, chunk_size)
-        structured_burst(field, seed, chunk_count, chunk_size, text, parsed)
+        structured_burst(field, seed, chunk_count, chunk_size, text, parsed, opts)
 
       {:error, reason} ->
         unstructured_burst(field, seed, text, reason)
     end
   end
 
-  defp structured_burst(field, seed, chunk_count, chunk_size, text, parsed) do
+  defp structured_burst(field, seed, chunk_count, chunk_size, text, parsed, opts) do
     mapping = Map.get(parsed, :mapping, %{})
     verification = Scoring.verify_mapping(mapping, parsed.random_string, chunk_size)
 
@@ -1518,7 +1652,14 @@ defmodule AntiAgents.Bursts do
       |> Map.put(:seed_coverage, verification.coverage)
 
     descriptor =
-      Scoring.descriptor(base.answer, mapping, base.random_string, chunk_count, verification)
+      Scoring.descriptor(
+        base.answer,
+        mapping,
+        base.random_string,
+        chunk_count,
+        verification,
+        opts
+      )
 
     candidate = Scoring.enrich(base, descriptor, base.seed_coverage)
 
@@ -1691,6 +1832,21 @@ defmodule AntiAgents.Bursts do
 
   defp get_coordinate(opts, key, default), do: get_in(opts, [:coordinate, key]) || default
 
+  defp put_frontier_temperature(opts, index) do
+    case Keyword.get(opts, :frontier_temperature_sweep, []) do
+      [] ->
+        opts
+
+      temperatures ->
+        temp = Enum.at(temperatures, rem(index - 1, length(temperatures)))
+        Keyword.update(opts, :heat, [answer: temp], &put_answer_temperature(&1, temp))
+    end
+  end
+
+  defp put_answer_temperature(heat, temp) when is_list(heat), do: Keyword.put(heat, :answer, temp)
+  defp put_answer_temperature(heat, temp) when is_map(heat), do: Map.put(heat, :answer, temp)
+  defp put_answer_temperature(_heat, temp), do: [answer: temp]
+
   defp progress_llm_index(opts) do
     offset = Keyword.get(opts, :progress_llm_offset, 0)
 
@@ -1716,6 +1872,8 @@ defmodule AntiAgents.Frontier do
   @moduledoc false
 
   alias AntiAgents.{BurstResult, Bursts, Field, FrontierReport, Progress, Prompt, Scoring}
+  alias AntiAgents.Distance
+  alias AntiAgents.Distance.Embedding
   alias AntiAgents.Statistics
 
   @type compare_output :: %{
@@ -1742,6 +1900,7 @@ defmodule AntiAgents.Frontier do
       ])
 
     baseline_count = baseline_method_count(baseline_opts)
+    matched_baseline_opts = Keyword.get(opts, :matched_baseline_methods) || baseline_opts
     planned_frontier_calls = branch_count * rounds
     planned_matched_calls = if matched_budget?, do: planned_frontier_calls, else: 0
     total_llm_calls = baseline_count + planned_frontier_calls + planned_matched_calls
@@ -1754,6 +1913,8 @@ defmodule AntiAgents.Frontier do
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
     })
 
+    maybe_warn_ignored_heat(opts)
+
     Progress.event(opts, :compare_start, %{
       branching: branch_count,
       baseline_methods: baseline_count
@@ -1761,6 +1922,9 @@ defmodule AntiAgents.Frontier do
 
     Progress.event(opts, :baseline_start, %{methods: baseline_count})
     {reachable, baseline_stats} = baseline_bursts(field, baseline_opts, opts, total_llm_calls)
+    {semantic_opts, semantic_descriptor} = semantic_descriptor_context(reachable, opts)
+    opts = Keyword.merge(opts, semantic_opts)
+    reachable = redescribe_archive(reachable, opts)
 
     Progress.event(opts, :baseline_done, Map.put(baseline_stats, :accepted, length(reachable)))
     Progress.event(opts, :frontier_start, %{branching: planned_frontier_calls})
@@ -1774,7 +1938,7 @@ defmodule AntiAgents.Frontier do
       if matched_budget? and accepted_frontier_count > 0 do
         matched_baseline(
           field,
-          baseline_opts,
+          matched_baseline_opts,
           Keyword.merge(opts,
             matched_baseline_count: accepted_frontier_count,
             progress_llm_offset: baseline_count + planned_frontier_calls,
@@ -1800,10 +1964,107 @@ defmodule AntiAgents.Frontier do
       stagnation_at_round: stagnation_at_round,
       rounds: rounds,
       novel_frontier_cell_count: novel_cell_count(frontier_bursts, reachable),
-      baseline_stats: merge_baseline_stats([baseline_stats, matched_stats]),
+      baseline_stats: baseline_stats,
+      matched_baseline_stats: matched_stats,
+      semantic_descriptor: semantic_descriptor,
       reachable_hits: reachable_intersections(frontier_bursts, reachable),
       duplicates: duplicates(frontier_bursts)
     }
+  end
+
+  defp maybe_warn_ignored_heat(opts) do
+    case ignored_heat_phases(opts) do
+      [] -> :ok
+      phases -> Progress.event(opts, :heat_phase_ignored, %{phases: phases})
+    end
+  end
+
+  defp ignored_heat_phases(opts) do
+    heat = Keyword.get(opts, :heat, [])
+    seed = heat_value(heat, :seed, 1.3)
+    assembly = heat_value(heat, :assembly, 1.15)
+
+    []
+    |> maybe_add_ignored_phase(:seed, seed, 1.3)
+    |> maybe_add_ignored_phase(:assembly, assembly, 1.15)
+  end
+
+  defp heat_value(heat, key, default) when is_list(heat), do: Keyword.get(heat, key, default)
+  defp heat_value(heat, key, default) when is_map(heat), do: Map.get(heat, key, default)
+  defp heat_value(_heat, _key, default), do: default
+
+  defp maybe_add_ignored_phase(phases, _phase, value, default) when value == default, do: phases
+  defp maybe_add_ignored_phase(phases, phase, _value, _default), do: [phase | phases]
+
+  defp semantic_descriptor_context(reachable, opts) do
+    cond do
+      not embedding_distance?(opts) ->
+        {[], %{status: :unknown, centroid_ids: []}}
+
+      Keyword.get(opts, :embedding_client) == nil ->
+        Progress.event(opts, :semantic_descriptor_degraded, %{
+          reason: :embedding_client_not_configured
+        })
+
+        {[], %{status: :degraded, reason: :embedding_client_not_configured, centroid_ids: []}}
+
+      reachable == [] ->
+        {[], %{status: :degraded, reason: :empty_reachable_archive, centroid_ids: []}}
+
+      true ->
+        fit_semantic_descriptor(reachable, opts)
+    end
+  end
+
+  defp embedding_distance?(opts) do
+    opts
+    |> Keyword.get(:distance, :jaccard)
+    |> Distance.resolve()
+    |> Kernel.==(Embedding)
+  end
+
+  defp fit_semantic_descriptor(reachable, opts) do
+    texts = Enum.map(reachable, & &1.answer)
+
+    case Embedding.embed(texts, opts) do
+      {:ok, vectors} ->
+        k = reachable |> length() |> div(2) |> max(1) |> min(8)
+        centroids = Scoring.fit_centroids(vectors, k)
+        ids = Scoring.centroid_ids(centroids)
+
+        {
+          [
+            semantic_centroids: centroids,
+            semantic_centroid_ids: ids,
+            semantic_descriptor_status: :embedding
+          ],
+          %{status: :embedding, centroid_ids: ids}
+        }
+
+      {:error, reason} ->
+        Progress.event(opts, :semantic_descriptor_degraded, %{reason: reason})
+        {[], %{status: :degraded, reason: reason, centroid_ids: []}}
+    end
+  end
+
+  defp redescribe_archive(bursts, opts) do
+    Enum.map(bursts, &redescribe_burst(&1, opts))
+  end
+
+  defp redescribe_burst(%BurstResult{} = burst, opts) do
+    chunk_total = get_in(burst.descriptor, [:seed_profile, :chunk_total]) || 1
+
+    descriptor =
+      Scoring.descriptor(
+        burst.answer,
+        burst.mapping_trace,
+        burst.random_string,
+        chunk_total,
+        burst.mapping_verification,
+        opts
+      )
+
+    %{burst | descriptor: descriptor}
   end
 
   def matched_baseline(%Field{} = field, baseline_methods, opts \\ []) do
@@ -1858,26 +2119,70 @@ defmodule AntiAgents.Frontier do
   defp archive_steering_delta([], _round), do: nil
 
   defp archive_steering_delta(accepted_so_far, _round) do
-    overfilled =
-      accepted_so_far
-      |> Enum.map(& &1.descriptor.cell)
-      |> Enum.frequencies()
-      |> Enum.max_by(fn {_cell, count} -> count end, fn -> {nil, 0} end)
-      |> elem(0)
+    occupied = Enum.map(accepted_so_far, & &1.descriptor.cell)
+    overfilled = most_populated_cell(occupied)
+    underfilled = underfilled_cells(occupied)
 
-    if is_nil(overfilled) do
+    if is_nil(overfilled) or underfilled == [] do
       nil
     else
+      target = Enum.at(underfilled, rem(length(accepted_so_far), length(underfilled)))
+
       %{
         text:
-          "Prefer a descriptor region unlike #{cell_label(overfilled)}; avoid repeating the most populated archive cell."
+          "Aim for underfilled #{cell_label(target)}; avoid overfilled #{cell_label(overfilled)}."
           |> String.slice(0, 200)
       }
     end
   end
 
+  defp most_populated_cell(cells) do
+    cells
+    |> Enum.frequencies()
+    |> Enum.max_by(fn {_cell, count} -> count end, fn -> {nil, 0} end)
+    |> elem(0)
+  end
+
+  defp underfilled_cells(occupied) do
+    occupied_set = MapSet.new(occupied)
+    clusters = active_semantic_clusters(occupied)
+
+    for length <- [:short, :medium, :long, :extended],
+        sentence_count <- [:single, :small, :medium, :large],
+        affect <- [:low, :medium, :high],
+        abstraction <- [:low, :mid, :high],
+        semantic_cluster <- clusters,
+        cell = %{
+          length: length,
+          sentence_count: sentence_count,
+          affect: affect,
+          abstraction: abstraction,
+          semantic_cluster: semantic_cluster
+        },
+        not MapSet.member?(occupied_set, cell) do
+      cell
+    end
+  end
+
+  defp active_semantic_clusters(cells) do
+    cells
+    |> Enum.map(&Map.get(&1, :semantic_cluster, :unknown))
+    |> Enum.uniq()
+    |> case do
+      [] -> [:unknown]
+      clusters -> clusters
+    end
+  end
+
   defp cell_label(cell) when is_map(cell) do
-    Enum.map_join(cell, "/", fn {key, value} -> "#{key}=#{value}" end)
+    [
+      "length=#{cell[:length]}",
+      "sentences=#{cell[:sentence_count]}",
+      "affect=#{cell[:affect]}",
+      "abstraction=#{cell[:abstraction]}",
+      "cluster=#{cell[:semantic_cluster]}"
+    ]
+    |> Enum.join("/")
   end
 
   defp cell_label(cell), do: inspect(cell)
@@ -1903,6 +2208,18 @@ defmodule AntiAgents.Frontier do
     frontier_cell_count = length(frontier_cells)
     novel_frontier_cell_count = frontier_cell_count
 
+    empirical_cell_space =
+      distinct_cell_count(report.reachable_archive ++ accepted ++ report.matched_baseline_archive)
+
+    saturation =
+      if empirical_cell_space == 0 do
+        0.0
+      else
+        frontier_cell_count / empirical_cell_space
+      end
+
+    cell_saturation_warning = saturation > 0.8
+
     baseline_loss_adjustment =
       baseline_loss_adjustment(
         report.baseline_stats.permanent_loss_count,
@@ -1915,6 +2232,17 @@ defmodule AntiAgents.Frontier do
 
     coverage_delta = avg(accepted, :seed_coverage) - avg(report.reachable_archive, :seed_coverage)
     hypothesis_test = hypothesis_test(accepted, report.matched_baseline_archive, opts)
+    matched_baseline_cell_count = Statistics.distinct_cell_count(report.matched_baseline_archive)
+
+    matched_baseline_loss_adjustment =
+      baseline_loss_adjustment(
+        report.matched_baseline_stats.permanent_loss_count,
+        report.matched_baseline_archive,
+        matched_baseline_cell_count
+      )
+
+    adjusted_matched_baseline_cell_count =
+      matched_baseline_cell_count + matched_baseline_loss_adjustment
 
     hypothesis_test =
       maybe_force_null_for_baseline_loss(hypothesis_test, adjusted_novel_frontier_cell_count)
@@ -1932,9 +2260,14 @@ defmodule AntiAgents.Frontier do
       baseline_permanent_loss_count: report.baseline_stats.permanent_loss_count,
       baseline_loss_adjustment: baseline_loss_adjustment,
       matched_baseline_archive: report.matched_baseline_archive,
-      matched_baseline_cell_count:
-        Statistics.distinct_cell_count(report.matched_baseline_archive),
+      matched_baseline_cell_count: matched_baseline_cell_count,
+      matched_baseline_retry_count: report.matched_baseline_stats.retry_count,
+      matched_baseline_permanent_loss_count: report.matched_baseline_stats.permanent_loss_count,
+      matched_baseline_loss_adjustment: matched_baseline_loss_adjustment,
+      adjusted_matched_baseline_cell_count: Float.round(adjusted_matched_baseline_cell_count, 3),
       hypothesis_test: hypothesis_test,
+      semantic_descriptor_status: report.semantic_descriptor.status,
+      semantic_centroid_ids: Map.get(report.semantic_descriptor, :centroid_ids, []),
       rounds: report.rounds,
       round_summaries: report.round_summaries,
       stagnation_at_round: report.stagnation_at_round,
@@ -1949,9 +2282,19 @@ defmodule AntiAgents.Frontier do
         distinct: length(frontier_cells),
         coherence: avg(accepted, :coherence),
         seed_coverage: avg(accepted, :seed_coverage),
-        archive_coverage: if(archive_size == 0, do: 0.0, else: length(accepted) / archive_size)
+        archive_coverage: if(archive_size == 0, do: 0.0, else: length(accepted) / archive_size),
+        empirical_cell_space: empirical_cell_space,
+        saturation: Float.round(saturation, 3),
+        cell_saturation_warning: cell_saturation_warning
       }
     }
+
+    if cell_saturation_warning do
+      Progress.event(opts, :cell_saturation_warning, %{
+        saturation: frontier_report.metrics.saturation,
+        empirical_cell_space: empirical_cell_space
+      })
+    end
 
     Progress.event(opts, :frontier_report_done, %{
       accepted: length(frontier_report.exemplars),
@@ -2057,7 +2400,7 @@ defmodule AntiAgents.Frontier do
 
     case ctx.client.complete(prompt, baseline_completion_opts(prompt, ctx.input, ctx.method_opts)) do
       {:ok, raw} ->
-        case build_baseline_burst(ctx.field, ctx.method, raw) do
+        case build_baseline_burst(ctx.field, ctx.method, raw, ctx.method_opts) do
           {:ok, burst} ->
             Progress.event(ctx.method_opts, :baseline_call_done, %{
               index: ctx.index,
@@ -2165,7 +2508,7 @@ defmodule AntiAgents.Frontier do
 
   defp baseline_method_opts(_method, opts), do: opts
 
-  defp build_baseline_burst(field, method, raw) do
+  defp build_baseline_burst(field, method, raw, opts) do
     with {:ok, text} <- Scoring.extract_text(raw),
          {:ok, answer} <- Scoring.clean_plain_answer(text) do
       {:ok,
@@ -2179,7 +2522,7 @@ defmodule AntiAgents.Frontier do
          status: :accepted,
          rejection_reason: nil,
          score: %{},
-         descriptor: Scoring.descriptor(answer, %{}, "", 1),
+         descriptor: Scoring.descriptor(answer, %{}, "", 1, nil, opts),
          coherence: Scoring.coherence(answer),
          seed_coverage: 0.0
        }}

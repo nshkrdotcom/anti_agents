@@ -83,7 +83,8 @@ defmodule AntiAgents.MixProject do
         "compile --warnings-as-errors",
         "test",
         "dialyzer",
-        "anti_agents.benchmark --fields priv/benchmarks/fields_v1.json --dry-run"
+        "anti_agents.benchmark --fields priv/benchmarks/fields_v1.json --dry-run",
+        "anti_agents.calibrate --stubbed"
       ]
     ]
   end

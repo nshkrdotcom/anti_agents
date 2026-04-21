@@ -6,6 +6,7 @@ defmodule AntiAgentsTest do
   alias AntiAgents.{BurstResult, Field, FrontierReport}
   alias AntiAgents.{Bursts, Distance, Progress, Scoring, Statistics}
   alias Mix.Tasks.AntiAgents.Benchmark, as: BenchmarkTask
+  alias Mix.Tasks.AntiAgents.Calibrate, as: CalibrateTask
   alias Mix.Tasks.AntiAgents.Frontier, as: FrontierTask
 
   defmodule FakeOptions do
@@ -510,6 +511,33 @@ defmodule AntiAgentsTest do
       assert length(bursts) == 3
       assert Enum.all?(bursts, &match?(%BurstResult{}, &1))
     end
+
+    test "assigns frontier temperature sweep round-robin" do
+      field = AntiAgents.field("temperature sweep")
+      test_pid = self()
+
+      AntiAgents.branch(field, 6,
+        client: BurstClient,
+        heat: [answer: 0.9],
+        frontier_temperature_sweep: [1.0, 1.2],
+        progress_callback: fn
+          :burst_call_start, meta ->
+            send(test_pid, {:burst_temperature, meta.index, meta.temperature})
+
+          _event, _meta ->
+            :ok
+        end
+      )
+
+      temperatures =
+        1..6
+        |> Enum.map(fn index ->
+          assert_receive {:burst_temperature, ^index, temperature}
+          temperature
+        end)
+
+      assert temperatures == [1.0, 1.2, 1.0, 1.2, 1.0, 1.2]
+    end
   end
 
   describe "compare/2 and frontier/2" do
@@ -538,6 +566,26 @@ defmodule AntiAgentsTest do
 
       assert Scoring.fit_centroids(inputs, 4) == [[1.0, 0.0], [0.0, 1.0]]
       assert Scoring.fit_centroids(inputs, 2) == [[1.0, 0.0], [0.0, 1.0]]
+    end
+
+    test "descriptor semantic cluster is integer with embedding centroids and unknown without them" do
+      centroids = Scoring.fit_centroids([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 2)
+
+      opts = [
+        distance: :embedding,
+        embedding_client: StubEmbeddingClient,
+        semantic_centroids: centroids
+      ]
+
+      first = Scoring.descriptor("cat memory", %{}, "", 1, nil, opts)
+      nearby = Scoring.descriptor("cat again", %{}, "", 1, nil, opts)
+      distant = Scoring.descriptor("ocean memory", %{}, "", 1, nil, opts)
+      degraded = Scoring.descriptor("cat memory", %{}, "", 1)
+
+      assert is_integer(first.cell.semantic_cluster)
+      assert first.cell.semantic_cluster == nearby.cell.semantic_cluster
+      refute first.cell.semantic_cluster == distant.cell.semantic_cluster
+      assert degraded.cell.semantic_cluster == :unknown
     end
 
     test "scoring weights sum to one and match documented components" do
@@ -597,6 +645,29 @@ defmodule AntiAgentsTest do
       assert lo <= hi
     end
 
+    test "per-field mean CI and sign test reject clear positive deltas" do
+      deltas = [2, 1, 1, 2, 1, 3, 2, 1]
+
+      ci = Statistics.mean_delta_ci(deltas, resamples: 500, seed: 12)
+      sign = Statistics.sign_test(deltas)
+
+      assert ci.mean_delta > 0
+      assert hd(ci.bootstrap_ci_95) > 0
+      assert sign.positives == 8
+      assert sign.p_value < 0.05
+    end
+
+    test "per-field sign test does not reject a mean-zero diagnostic sample" do
+      deltas = [1, -1, 0, 1, -1, 0, 0, 0]
+
+      ci = Statistics.mean_delta_ci(deltas, resamples: 500, seed: 12)
+      sign = Statistics.sign_test(deltas)
+
+      assert ci.mean_delta == 0.0
+      refute hd(ci.bootstrap_ci_95) > 0
+      assert sign.p_value >= 0.05
+    end
+
     test "frontier report has explicit fields" do
       field = AntiAgents.field("field for frontier", axes: [:ontology, :metaphor])
 
@@ -621,6 +692,26 @@ defmodule AntiAgentsTest do
       assert is_number(report.coverage_delta)
       assert Map.has_key?(report.metrics, :distinct)
       assert Map.has_key?(report.metrics, :archive_coverage)
+    end
+
+    test "frontier report flags descriptor cell saturation" do
+      field = AntiAgents.field("saturated descriptor", axes: [:ontology, :metaphor, :closure])
+
+      report =
+        AntiAgents.frontier(field,
+          baseline: [],
+          branching: 1,
+          matched_budget: false,
+          client: BurstClient,
+          coordinate: [chunk: 4]
+        )
+
+      assert report.metrics.empirical_cell_space == 1
+      assert report.metrics.saturation == 1.0
+      assert report.metrics.cell_saturation_warning == true
+
+      trace = AntiAgents.Trace.report(report)
+      assert trace["evidence"]["cell_saturation_warning"] == true
     end
 
     test "compare returns reachable and frontier archives" do
@@ -823,6 +914,51 @@ defmodule AntiAgentsTest do
       assert report.adjusted_novel_frontier_cell_count <= report.novel_frontier_cell_count
     end
 
+    test "matched baseline retry stats are separated from reachable baseline stats" do
+      {:ok, queue} =
+        Agent.start_link(fn ->
+          [
+            "Reachable short baseline.",
+            valid_burst_json(
+              "az4qk9lm2pxt7vbr8c",
+              "A substantially longer frontier answer that should occupy a different structural cell from the baseline.",
+              axes: ["ontology", "metaphor", "closure"],
+              chunks: [0, 1, 2],
+              chunk_size: 4
+            ),
+            "```json\n{\"mode\":\"dry_run\",\"exemplars\":[]}\n```",
+            "Matched baseline clean answer."
+          ]
+        end)
+
+      field = AntiAgents.field("matched stats", axes: [:ontology, :metaphor, :closure])
+
+      report =
+        AntiAgents.frontier(field,
+          client: QueueClient,
+          client_opts: [queue: queue],
+          baseline: [:plain],
+          branching: 1,
+          matched_budget: true,
+          baseline_retry_budget: 1,
+          coordinate: [chunk: 4],
+          heat: [answer: 1.0]
+        )
+
+      assert report.baseline_retry_count == 0
+      assert report.baseline_permanent_loss_count == 0
+      assert report.matched_baseline_retry_count == 1
+      assert report.matched_baseline_permanent_loss_count == 0
+      assert report.matched_baseline_loss_adjustment == 0.0
+
+      assert report.adjusted_matched_baseline_cell_count ==
+               report.matched_baseline_cell_count * 1.0
+
+      trace = AntiAgents.Trace.report(report)
+      assert trace["evidence"]["matched_baseline_retry_count"] == 1
+      assert trace["evidence"]["matched_baseline_permanent_loss_count"] == 0
+    end
+
     test "baseline calls use a clean non-SSoT contract except explicit seed injection" do
       field = AntiAgents.field("field for clean baselines")
 
@@ -913,7 +1049,8 @@ defmodule AntiAgentsTest do
         Enum.filter(prompts, &String.contains?(&1, "Produce exactly one exploration"))
 
       assert length(frontier_prompts) == 2
-      assert Enum.at(frontier_prompts, 1) =~ "Archive feedback"
+      assert Enum.at(frontier_prompts, 1) =~ "Archive feedback: Aim for underfilled"
+      assert Enum.at(frontier_prompts, 1) =~ "avoid overfilled"
     end
 
     test "frontier records stagnation when a round has no accepted bursts" do
@@ -1242,6 +1379,8 @@ defmodule AntiAgentsTest do
                  "12",
                  "--temperature",
                  "1.18",
+                 "--frontier-temperature-sweep",
+                 "1.0|1.2",
                  "--model",
                  "gpt-5.4-mini",
                  "--reasoning",
@@ -1279,6 +1418,7 @@ defmodule AntiAgentsTest do
       assert opts[:model] == "gpt-5.4-mini"
       assert opts[:reasoning_effort] == :low
       assert opts[:heat][:answer] == 1.18
+      assert opts[:frontier_temperature_sweep] == [1.0, 1.2]
       assert opts[:baseline] == [:plain, :paraphrase, {:temperature, [0.8, 1.0]}]
       assert opts[:field][:toward] == ["machine pastoral"]
       assert opts[:field][:away_from] == ["standard sci-fi"]
@@ -1428,7 +1568,7 @@ defmodule AntiAgentsTest do
             path,
             "--dry-run",
             "--branching",
-            "2",
+            "4",
             "--repetitions",
             "3",
             "--baseline",
@@ -1439,10 +1579,141 @@ defmodule AntiAgentsTest do
       assert output =~ "\"mode\": \"benchmark_dry_run\""
       assert output =~ "\"field_count\": 2"
       assert output =~ "\"repetitions\": 3"
-      assert output =~ "\"planned_llm_calls\": 36"
+      assert output =~ "\"planned_llm_calls\": 60"
       assert output =~ "\"fields_sha256\""
     after
       File.rm("tmp/test_fields.json")
+    end
+
+    test "mix benchmark refuses branching below four unless diagnostic" do
+      Mix.Task.reenable("anti_agents.benchmark")
+      path = "tmp/test_fields.json"
+
+      File.write!(
+        path,
+        Jason.encode!([
+          %{"id" => "a", "prompt" => "field a", "axes" => ["ontology"]}
+        ])
+      )
+
+      assert_raise Mix.Error, ~r/--branching 1 is diagnostic-only.*--diagnostic/s, fn ->
+        BenchmarkTask.run([
+          "--fields",
+          path,
+          "--dry-run",
+          "--branching",
+          "1",
+          "--baseline",
+          "plain"
+        ])
+      end
+    after
+      File.rm("tmp/test_fields.json")
+    end
+
+    test "mix benchmark diagnostic dry-run allows branching one and marks mode" do
+      Mix.Task.reenable("anti_agents.benchmark")
+      path = "tmp/test_fields.json"
+
+      File.write!(
+        path,
+        Jason.encode!([
+          %{"id" => "a", "prompt" => "field a", "axes" => ["ontology"]}
+        ])
+      )
+
+      output =
+        capture_io(fn ->
+          BenchmarkTask.run([
+            "--fields",
+            path,
+            "--dry-run",
+            "--diagnostic",
+            "--branching",
+            "1",
+            "--repetitions",
+            "1",
+            "--baseline",
+            "plain"
+          ])
+        end)
+
+      assert output =~ "\"mode\": \"benchmark_diagnostic\""
+      assert output =~ "\"dry_run\": true"
+      assert output =~ "\"diagnostic\": true"
+      assert output =~ "\"planned_llm_calls\": 3"
+    after
+      File.rm("tmp/test_fields.json")
+    end
+
+    test "mix benchmark profile supplies defaults and records CLI overrides" do
+      Mix.Task.reenable("anti_agents.benchmark")
+      fields_path = "tmp/test_fields.json"
+      profile_path = "tmp/test_profile.json"
+
+      File.write!(
+        fields_path,
+        Jason.encode!([
+          %{"id" => "a", "prompt" => "field a", "axes" => ["ontology"]}
+        ])
+      )
+
+      File.write!(
+        profile_path,
+        Jason.encode!(%{
+          "id" => "test-profile",
+          "model" => "profile-model",
+          "reasoning_effort" => "high",
+          "thinking_budget" => 3000,
+          "branching" => 5,
+          "repetitions" => 2,
+          "baseline" => ["plain"],
+          "frontier_temperature_sweep" => [1.0, 1.2],
+          "distance" => "embedding",
+          "bootstrap_resamples" => 123
+        })
+      )
+
+      output =
+        capture_io(fn ->
+          BenchmarkTask.run([
+            "--fields",
+            fields_path,
+            "--profile",
+            profile_path,
+            "--dry-run",
+            "--branching",
+            "4",
+            "--reasoning",
+            "low"
+          ])
+        end)
+
+      assert output =~ "\"profile_id\": \"test-profile\""
+      assert output =~ "\"model\": \"profile-model\""
+      assert output =~ "\"reasoning_effort\": \"low\""
+      assert output =~ "\"thinking_budget\": 3000"
+      assert output =~ "\"branching\": 4"
+      assert output =~ "\"profile_overrides\""
+      assert output =~ "\"reasoning_effort\": \"low\""
+      assert output =~ "\"planned_llm_calls\": 18"
+    after
+      File.rm("tmp/test_fields.json")
+      File.rm("tmp/test_profile.json")
+    end
+
+    test "mix calibrate stubbed positive control rejects the null" do
+      Mix.Task.reenable("anti_agents.calibrate")
+
+      output =
+        capture_io(fn ->
+          CalibrateTask.run(["--stubbed"])
+        end)
+
+      assert output =~ "\"mode\": \"calibration_report\""
+      assert output =~ "\"stubbed\": true"
+      assert output =~ "\"rejects_null\": true"
+      assert output =~ "\"calibration_status\": \"ok\""
     end
 
     test "benchmark verbose progress reports global run and LLM position" do
@@ -1662,6 +1933,7 @@ defmodule AntiAgentsTest do
               Progress.event(opts, :baseline_done, %{accepted: 0})
 
               Progress.event(opts, :frontier_start, %{branching: 1})
+              Progress.event(opts, :heat_phase_ignored, %{phases: [:seed, :assembly]})
               Progress.event(opts, :branch_start, %{count: 1, concurrency: 1, timeout_ms: 10})
 
               Progress.event(opts, :burst_call_start, %{
@@ -1731,6 +2003,7 @@ defmodule AntiAgentsTest do
       assert output =~ "rejected from reachable archive"
       assert output =~ "retrying"
       assert output =~ "Stage 2/3 frontier exploration"
+      assert output =~ "ignored_heat_phases"
       assert output =~ "failed"
       assert output =~ "accepted"
       assert output =~ "Trace written"
@@ -1768,6 +2041,8 @@ defmodule AntiAgentsTest do
         baseline_permanent_loss_count: 0,
         baseline_loss_adjustment: 0.0,
         adjusted_novel_frontier_cell_count: 1.0,
+        semantic_descriptor_status: :embedding,
+        semantic_centroid_ids: ["abc123"],
         hypothesis_test: %{
           delta_distinct_cells: 1,
           bootstrap_ci_95: [1.0, 1.0],
@@ -1784,6 +2059,8 @@ defmodule AntiAgentsTest do
 
       assert trace["synthesis"]["essential_aspect"] =~ "entropy-first"
       assert trace["run"]["model"] == "gpt-5.4-mini"
+      assert trace["run"]["semantic_descriptor_status"] == "embedding"
+      assert trace["run"]["semantic_centroid_ids"] == ["abc123"]
       refute Map.has_key?(trace["evidence"], "meaningful_signal")
       assert trace["evidence"]["reachable_baseline_count"] == 1
       assert trace["evidence"]["novel_frontier_cell_count"] == 1

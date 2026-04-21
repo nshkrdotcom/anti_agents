@@ -351,6 +351,18 @@ defmodule AntiAgents.Progress do
     "Stage 2/3 frontier exploration: #{metadata[:branching]} SSoT bursts. Why: internal random string -> local mapping -> answer, then reject collapse/reachable duplicates."
   end
 
+  defp message(:semantic_descriptor_degraded, metadata, _snapshot, _opts) do
+    "Semantic descriptor degraded to surface buckets | reason=#{inspect(metadata[:reason])}"
+  end
+
+  defp message(:heat_phase_ignored, metadata, _snapshot, _opts) do
+    "Provider temperature warning | ignored_heat_phases=#{inspect(metadata[:phases])}; only answer/model temperature is currently forwarded"
+  end
+
+  defp message(:cell_saturation_warning, metadata, _snapshot, _opts) do
+    "Descriptor saturation warning | saturation=#{metadata[:saturation]} | empirical_cell_space=#{metadata[:empirical_cell_space]}"
+  end
+
   defp message(:branch_start, metadata, _snapshot, _opts) do
     "Launching frontier burst batch | bursts=#{metadata[:count]} | concurrency=#{metadata[:concurrency]} | timeout_ms=#{metadata[:timeout_ms]}"
   end

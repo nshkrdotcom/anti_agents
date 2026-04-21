@@ -137,7 +137,8 @@ The harness adopts a concrete and falsifiable hypothesis:
 > Across a fixed field set, SSoT frontier bursts should produce more distinct
 > descriptor cells than an equal-size matched-baseline continuation. The null
 > hypothesis is `E[delta_distinct_cells] <= 0`; the benchmark rejects the null
-> only when the bootstrap-resampled 95% lower bound is strictly positive.
+> only when the per-field mean-delta bootstrap 95% lower bound is strictly
+> positive and a one-sided sign test gives `p < 0.05`.
 
 The single-run accounting still reports `novel_frontier_cell_count`, but the
 benchmark statistic is stricter:
@@ -149,6 +150,11 @@ matched_cells = unique_descriptor_cells(matched_baseline_continuation)
 
 novel_frontier_cell_count = |frontier_cells \ reachable_cells|
 delta_distinct_cells = |frontier_cells| - |matched_cells|
+
+aggregate_mean_delta = mean(delta_distinct_cells_per_field_run)
+rejects_null =
+  lower_bound(bootstrap_ci_95(aggregate_mean_delta)) > 0
+  and sign_test_p < 0.05
 ```
 
 A positive `novel_frontier_cell_count` is a pilot signal. A positive benchmark
@@ -257,8 +263,11 @@ The live benchmark report writes `evidence.hypothesis_test.rejects_null` as a
 boolean. A `false` value is a valid empirical result and should be reported, not
 suppressed.
 
-A 12-field smoke benchmark was run with one plain baseline, one frontier burst,
-one matched-baseline continuation, and 200 bootstrap resamples per run:
+#### Diagnostic
+
+A 12-field diagnostic smoke benchmark was run with one plain baseline, one
+frontier burst, one matched-baseline continuation, and 200 bootstrap resamples
+per run:
 
 ```json
 {
@@ -285,12 +294,15 @@ but this small smoke run does **not** support the positive research hypothesis:
 the aggregate frontier did not exceed the matched baseline in distinct-cell
 count. That is expected for a deliberately tiny `branching: 1` smoke test; the
 result is useful as a harness check, not as evidence of frontier advantage.
+Current builds require `--diagnostic` for any `--branching < 4` benchmark run,
+and mark such traces as `mode: "benchmark_diagnostic"`.
 
-For live benchmark runs, use verbose mode when collecting evidence:
+For diagnostic smoke runs, use verbose mode:
 
 ```bash
 mix anti_agents.benchmark \
   --fields priv/benchmarks/fields_v1.json \
+  --diagnostic \
   --branching 1 \
   --repetitions 1 \
   --baseline plain \
@@ -319,6 +331,34 @@ The local `1/3` counter describes the current field-level run; the global
 `16/36` counter describes the whole benchmark. This distinction matters because
 the benchmark repeats the same three-stage frontier comparison across every
 field and repetition.
+
+#### Evidence
+
+No evidence-grade benchmark trace is reported yet. Evidence runs require the
+calibration path described in `docs/validation_protocol.md`; diagnostic traces
+must not be cited as evidence. The current blocker is operational rather than
+statistical: the evidence profile requires embedding-backed descriptors and a
+large reasoning-model run, while the CLI does not yet configure a production
+embedding provider and the planned call count is intentionally gated as
+expensive.
+
+The stubbed positive control must pass before interpreting a live benchmark:
+
+```bash
+mix anti_agents.calibrate --stubbed
+```
+
+Cited benchmark numbers must use the evidence profile:
+
+```bash
+mix anti_agents.benchmark \
+  --profile priv/profiles/evidence.json \
+  --fields priv/benchmarks/fields_v1.json \
+  --out tmp/anti_agents_evidence.json
+```
+
+Profile values provide defaults and CLI flags override them. Overrides are
+recorded in the trace under `run.profile_overrides`.
 
 ## Mechanism
 
@@ -355,6 +395,9 @@ demonstration code:
   tutorial responses before such content can enter either archive.
 - Baseline artefacts are retried up to `--baseline-retry-budget`; permanent
   losses are debited through `adjusted_novel_frontier_cell_count`.
+- Matched-baseline artefacts are retried through the same baseline path and are
+  reported separately as matched retry/loss counters, because control-arm losses
+  should not be hidden inside reachable-baseline accounting.
 - Random-string guards reject nonce copying, excessively short strings,
   highly repetitive strings, and duplicate model-generated random strings
   observed within a single frontier run.
@@ -468,6 +511,7 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
 | `bootstrap_resamples` | `2000` | percentile bootstrap resamples for hypothesis test |
 | `baseline_retry_budget` | `2` | retries for rejected baseline artefacts |
 | `distance` | `:jaccard` | `:jaccard`, `:embedding`, or `:judge` |
+| `frontier_temperature_sweep` | `[]` | optional round-robin temperatures for frontier bursts |
 | `coordinate` | `[length: 32, chunk: 5]` | seed length and chunk size |
 | `thinking_budget` | `1200` | `max_tokens` forwarded to the model |
 | `model` | `"gpt-5.4-mini"` | Codex model string |
@@ -492,12 +536,18 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
   novel_frontier_cell_count: 2,
   adjusted_novel_frontier_cell_count: 2.0,
   matched_baseline_cell_count: 1,
+  matched_baseline_retry_count: 0,
+  matched_baseline_permanent_loss_count: 0,
+  matched_baseline_loss_adjustment: 0.0,
+  adjusted_matched_baseline_cell_count: 1.0,
   hypothesis_test: %{
     delta_distinct_cells: 1,
     bootstrap_ci_95: [0.0, 2.0],
     rejects_null: false,
     n_resamples: 2000
   },
+  semantic_descriptor_status: :unknown,
+  semantic_centroid_ids: [],
   baseline_retry_count: 0,
   baseline_permanent_loss_count: 0,
   baseline_loss_adjustment: 0.0,
@@ -512,7 +562,10 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
     distinct:         2,     # unique descriptor cells in accepted frontier
     coherence:        0.75,  # mean coherence of accepted bursts
     seed_coverage:    0.97,  # mean fraction of verified seed chunks referenced in mapping
-    archive_coverage: 0.83   # accepted / attempted frontier bursts
+    archive_coverage: 0.83,  # accepted / attempted frontier bursts
+    empirical_cell_space: 12,
+    saturation:       0.5,
+    cell_saturation_warning: false
   }
 }
 ```
@@ -556,10 +609,12 @@ Near-duplicate detection uses a similarity threshold of `0.91`.
 
 Descriptor cells are buckets over
 `{length, sentence_count, affect, abstraction, semantic_cluster}` used for
-archive-membership testing. `semantic_cluster` degrades to `:unknown` when no
-embedding centroids are fitted. Seed coverage is deliberately excluded from cell
-identity; including it would allow SSoT outputs to appear novel merely because
-baselines carry no mapping trace.
+archive-membership testing. With `--distance embedding` and a configured
+embedding client, `semantic_cluster` is an integer assigned by nearest fitted
+centroid from the reachable baseline archive. Without embeddings it explicitly
+degrades to `:unknown`, which is diagnostic rather than evidence-grade. Seed
+coverage is deliberately excluded from cell identity; including it would allow
+SSoT outputs to appear novel merely because baselines carry no mapping trace.
 
 ## CLI
 
@@ -570,6 +625,7 @@ mix anti_agents.frontier "the memory of a color that doesn't exist" \
   --branching 12 \
   --rounds 2 \
   --temperature 1.18 \
+  --frontier-temperature-sweep '1.0|1.1|1.2' \
   --model gpt-5.4-mini \
   --reasoning low \
   --baseline 'plain,paraphrase,temp:0.8|1.0' \
@@ -647,6 +703,12 @@ descriptor.
 still uses lexical Jaccard because it is transparent and cheap. Embedding and
 judge backends exist as explicit paths, but cited results should state which
 backend was used and whether provider-specific embeddings were configured.
+
+**Descriptor ceiling.** The benchmark reports `empirical_cell_space`,
+`saturation`, `cell_saturation_warning`, and benchmark-level
+`calibration_status`. A null result with `calibration_status:
+"descriptor_saturated"` is an instrument warning, not evidence that the SSoT
+method lacks signal.
 
 **Model dependence.** The SSoT paper emphasises that the method depends on
 reasoning capability. Smaller or weaker models may fail to generate useful

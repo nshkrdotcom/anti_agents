@@ -32,6 +32,28 @@ Field
 - Frontier Mix task: single-field CLI.
 - Benchmark Mix task: multi-field matched-budget benchmark CLI.
 
+## Statistical Pipeline
+
+```text
+burst
+  -> descriptor cell
+  -> per-run frontier cell count
+  -> per-run matched-baseline cell count
+  -> per-field delta
+  -> bootstrap CI over mean delta
+  -> one-sided sign test
+  -> aggregate rejects_null decision
+```
+
+The pooled distinct-cell statistic is retained only as a diagnostic field. The
+headline benchmark decision uses per-field/repetition deltas so cells from
+different prompts do not collide in one shared surface bucket vocabulary.
+
+Descriptor saturation is tracked separately through `empirical_cell_space`,
+`saturation`, and `cell_saturation_warning`. If too many runs saturate the
+available descriptor space, the benchmark-level `calibration_status` is set to
+`descriptor_saturated`.
+
 ## Boundary
 
 The current system explores the reachable output manifold through prompt-time

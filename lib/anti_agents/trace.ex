@@ -25,7 +25,7 @@ defmodule AntiAgents.Trace do
       "mode" => "frontier_report",
       "synthesis" => synthesis(),
       "field" => field(report.field),
-      "run" => run(opts),
+      "run" => run(opts, report),
       "metrics" => json_safe(report.metrics),
       "evidence" => evidence(report),
       "frontier_cell_count" => report.frontier_cell_count,
@@ -37,6 +37,10 @@ defmodule AntiAgents.Trace do
       "baseline_permanent_loss_count" => report.baseline_permanent_loss_count,
       "baseline_loss_adjustment" => report.baseline_loss_adjustment,
       "matched_baseline_cell_count" => report.matched_baseline_cell_count,
+      "matched_baseline_retry_count" => report.matched_baseline_retry_count,
+      "matched_baseline_permanent_loss_count" => report.matched_baseline_permanent_loss_count,
+      "matched_baseline_loss_adjustment" => report.matched_baseline_loss_adjustment,
+      "adjusted_matched_baseline_cell_count" => report.adjusted_matched_baseline_cell_count,
       "hypothesis_test" => json_safe(report.hypothesis_test),
       "rounds" => report.rounds,
       "round_summaries" => json_safe(report.round_summaries),
@@ -75,17 +79,70 @@ defmodule AntiAgents.Trace do
     }
   end
 
-  defp run(opts) do
+  defp run(opts), do: run(opts, nil)
+
+  defp run(opts, report) do
     %{
       "model" => AntiAgents.CodexConfig.model(opts),
       "reasoning_effort" => Atom.to_string(AntiAgents.CodexConfig.reasoning_effort(opts)),
+      "profile_id" => Keyword.get(opts, :profile_id),
+      "profile_overrides" => json_safe(Keyword.get(opts, :profile_overrides, %{})),
       "temperature" => AntiAgents.Prompt.response_temperature(opts),
+      "frontier_temperature_points" => frontier_temperature_points(opts),
+      "matched_baseline_temperature_points" => matched_baseline_temperature_points(opts),
+      "ignored_heat_phases" => ignored_heat_phases(opts),
       "branching" => Keyword.get(opts, :branching, 8),
       "baseline" => json_safe(Keyword.get(opts, :baseline, [])),
       "coordinate" => json_safe(Keyword.get(opts, :coordinate, [])),
-      "thinking_budget" => Keyword.get(opts, :thinking_budget, 1200)
+      "thinking_budget" => Keyword.get(opts, :thinking_budget, 1200),
+      "semantic_descriptor_status" => semantic_descriptor_status(report),
+      "semantic_centroid_ids" => semantic_centroid_ids(report)
     }
   end
+
+  defp semantic_descriptor_status(%FrontierReport{} = report),
+    do: Atom.to_string(report.semantic_descriptor_status)
+
+  defp semantic_descriptor_status(_report), do: "unknown"
+
+  defp semantic_centroid_ids(%FrontierReport{} = report), do: report.semantic_centroid_ids
+  defp semantic_centroid_ids(_report), do: []
+
+  defp frontier_temperature_points(opts) do
+    case Keyword.get(opts, :frontier_temperature_sweep, []) do
+      [] -> [AntiAgents.Prompt.response_temperature(opts)]
+      temperatures -> temperatures
+    end
+  end
+
+  defp matched_baseline_temperature_points(opts) do
+    opts
+    |> Keyword.get(:matched_baseline_methods, [])
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      {:temperature, temps} when is_list(temps) -> temps
+      {:temperature, temp} when is_number(temp) -> [temp]
+      _method -> []
+    end)
+  end
+
+  defp ignored_heat_phases(opts) do
+    heat = Keyword.get(opts, :heat, [])
+    seed = heat_value(heat, :seed, 1.3)
+    assembly = heat_value(heat, :assembly, 1.15)
+
+    []
+    |> maybe_add_ignored_phase(:seed, seed, 1.3)
+    |> maybe_add_ignored_phase(:assembly, assembly, 1.15)
+    |> Enum.map(&Atom.to_string/1)
+  end
+
+  defp heat_value(heat, key, default) when is_list(heat), do: Keyword.get(heat, key, default)
+  defp heat_value(heat, key, default) when is_map(heat), do: Map.get(heat, key, default)
+  defp heat_value(_heat, _key, default), do: default
+
+  defp maybe_add_ignored_phase(phases, _phase, value, default) when value == default, do: phases
+  defp maybe_add_ignored_phase(phases, phase, _value, _default), do: [phase | phases]
 
   defp field(%Field{} = field) do
     %{
@@ -132,6 +189,10 @@ defmodule AntiAgents.Trace do
       "novel_frontier_cell_count" => report.novel_frontier_cell_count,
       "adjusted_novel_frontier_cell_count" => report.adjusted_novel_frontier_cell_count,
       "matched_baseline_cell_count" => report.matched_baseline_cell_count,
+      "matched_baseline_retry_count" => report.matched_baseline_retry_count,
+      "matched_baseline_permanent_loss_count" => report.matched_baseline_permanent_loss_count,
+      "matched_baseline_loss_adjustment" => report.matched_baseline_loss_adjustment,
+      "adjusted_matched_baseline_cell_count" => report.adjusted_matched_baseline_cell_count,
       "rounds" => report.rounds,
       "round_summaries" => json_safe(report.round_summaries),
       "stagnation_at_round" => report.stagnation_at_round,
@@ -142,6 +203,9 @@ defmodule AntiAgents.Trace do
       "schema_rejected_count" => report.schema_rejected_count,
       "invalid_mapping_count" => report.invalid_mapping_count,
       "duplicate_random_string_count" => report.duplicate_random_string_count,
+      "empirical_cell_space" => Map.get(report.metrics, :empirical_cell_space, 0),
+      "saturation" => Map.get(report.metrics, :saturation, 0.0),
+      "cell_saturation_warning" => Map.get(report.metrics, :cell_saturation_warning, false),
       "mean_seed_coverage" => seed_coverage,
       "interpretation" =>
         interpretation(accepted_count, report.novel_frontier_cell_count, seed_coverage)

@@ -1,0 +1,18 @@
+{
+  "id": "evidence-v1",
+  "model": "gpt-5.4",
+  "reasoning_effort": "high",
+  "thinking_budget": 4000,
+  "branching": 8,
+  "repetitions": 3,
+  "baseline": [
+    "plain",
+    "paraphrase",
+    {
+      "temperature": [1.0, 1.1, 1.2]
+    }
+  ],
+  "frontier_temperature_sweep": [1.0, 1.1, 1.2],
+  "distance": "embedding",
+  "bootstrap_resamples": 2000
+}

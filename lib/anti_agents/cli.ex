@@ -15,6 +15,7 @@ defmodule AntiAgents.CLI do
     matched_budget: :boolean,
     bootstrap_resamples: :integer,
     temperature: :float,
+    frontier_temperature_sweep: :string,
     seed_temperature: :float,
     assembly_temperature: :float,
     thinking_budget: :integer,
@@ -62,6 +63,8 @@ defmodule AntiAgents.CLI do
       --branching N           frontier burst count, default 8
       --rounds N              adaptive archive-feedback rounds, default 1
       --temperature FLOAT     answer/model temperature request, default 1.05
+      --frontier-temperature-sweep LIST
+                              round-robin frontier temperatures, e.g. 1.0|1.1|1.2
       --model MODEL           default gpt-5.4-mini
       --reasoning EFFORT      default low
       --baseline LIST         plain,paraphrase,seed_injection,temp:0.8|1.0|1.2
@@ -82,6 +85,9 @@ defmodule AntiAgents.CLI do
   defp frontier_opts(opts) do
     answer_temperature = Keyword.get(opts, :temperature, 1.05)
 
+    frontier_temperature_sweep =
+      parse_temperature_sweep(Keyword.get(opts, :frontier_temperature_sweep))
+
     [
       dry_run: Keyword.get(opts, :dry_run, false),
       include_raw: Keyword.get(opts, :include_raw, false),
@@ -101,6 +107,9 @@ defmodule AntiAgents.CLI do
       matched_budget: Keyword.get(opts, :matched_budget, true),
       bootstrap_resamples: Keyword.get(opts, :bootstrap_resamples, 2_000),
       distance: opts |> Keyword.get(:distance, "jaccard") |> parse_distance(),
+      frontier_temperature_sweep: frontier_temperature_sweep,
+      matched_baseline_methods:
+        matched_baseline_methods(frontier_temperature_sweep, answer_temperature),
       model: Keyword.get(opts, :model, AntiAgents.CodexConfig.default_model()),
       reasoning_effort:
         opts
@@ -153,4 +162,13 @@ defmodule AntiAgents.CLI do
     |> String.split("|", trim: true)
     |> Enum.map(&String.to_float/1)
   end
+
+  defp parse_temperature_sweep(nil), do: []
+  defp parse_temperature_sweep(""), do: []
+  defp parse_temperature_sweep(text), do: parse_temperature_list(text)
+
+  defp matched_baseline_methods([], answer_temperature),
+    do: [{:temperature, [answer_temperature]}]
+
+  defp matched_baseline_methods(_sweep, _answer_temperature), do: nil
 end

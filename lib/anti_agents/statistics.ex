@@ -76,6 +76,72 @@ defmodule AntiAgents.Statistics do
     }
   end
 
+  @doc """
+  Extracts the per-field delta from a frontier report or benchmark run map.
+  """
+  @spec per_field_delta(map()) :: integer()
+  def per_field_delta(%{report: report}), do: per_field_delta(report)
+
+  def per_field_delta(%{hypothesis_test: %{delta_distinct_cells: delta}}) when is_integer(delta),
+    do: delta
+
+  def per_field_delta(%{hypothesis_test: %{"delta_distinct_cells" => delta}})
+      when is_integer(delta),
+      do: delta
+
+  def per_field_delta(%{exemplars: frontier, matched_baseline_archive: matched})
+      when is_list(frontier) and is_list(matched),
+      do: distinct_cell_count(frontier) - distinct_cell_count(matched)
+
+  @doc """
+  Bootstraps the mean per-field delta.
+  """
+  @spec mean_delta_ci([number()], keyword()) :: map()
+  def mean_delta_ci(deltas, opts \\ []) when is_list(deltas) do
+    resamples = Keyword.get(opts, :resamples, 2_000)
+    seed = Keyword.get(opts, :seed, 1)
+    mean_delta = mean(deltas)
+    {lo, hi} = bootstrap_ci(deltas, &mean/1, resamples: resamples, seed: seed)
+
+    %{
+      mean_delta: mean_delta,
+      bootstrap_ci_95: [lo, hi],
+      n_observations: length(deltas),
+      n_resamples: resamples
+    }
+  end
+
+  @doc """
+  One-sided sign test for H0 median(delta) <= 0.
+
+  Zeros are recorded but excluded from the binomial test.
+  """
+  @spec sign_test([number()]) :: map()
+  def sign_test(deltas) when is_list(deltas) do
+    positives = Enum.count(deltas, &(&1 > 0))
+    negatives = Enum.count(deltas, &(&1 < 0))
+    zeros = Enum.count(deltas, &(&1 == 0))
+    trials = positives + negatives
+
+    p_value =
+      if trials == 0 do
+        1.0
+      else
+        positives..trials
+        |> Enum.map(&binomial_probability(trials, &1))
+        |> Enum.sum()
+        |> min(1.0)
+      end
+
+    %{
+      positives: positives,
+      negatives: negatives,
+      zeros: zeros,
+      trials: trials,
+      p_value: Float.round(p_value, 6)
+    }
+  end
+
   @spec bootstrap_delta_ci([BurstResult.t()], [BurstResult.t()], keyword()) :: ci()
   def bootstrap_delta_ci(frontier, matched_baseline, opts) do
     resamples = Keyword.get(opts, :resamples, 2_000)
@@ -111,6 +177,24 @@ defmodule AntiAgents.Statistics do
       {rng, offset} = next_index(rng, length(samples))
       {rng, [Enum.at(samples, offset) | acc]}
     end)
+  end
+
+  defp mean([]), do: 0.0
+  defp mean(values), do: Enum.sum(values) / length(values)
+
+  defp binomial_probability(n, k) do
+    combination(n, k) * :math.pow(0.5, n)
+  end
+
+  defp combination(n, k) do
+    k = min(k, n - k)
+
+    if k == 0 do
+      1.0
+    else
+      1..k
+      |> Enum.reduce(1.0, fn i, acc -> acc * (n - k + i) / i end)
+    end
   end
 
   defp seed_rng(seed) when is_integer(seed), do: rem(abs(seed), 2_147_483_647)

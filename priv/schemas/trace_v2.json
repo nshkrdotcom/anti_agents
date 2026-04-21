@@ -27,7 +27,11 @@
         "adjusted_novel_frontier_cell_count",
         "baseline_retry_count",
         "baseline_permanent_loss_count",
-        "baseline_loss_adjustment"
+        "baseline_loss_adjustment",
+        "matched_baseline_retry_count",
+        "matched_baseline_permanent_loss_count",
+        "matched_baseline_loss_adjustment",
+        "adjusted_matched_baseline_cell_count"
       ]
     }
   }
