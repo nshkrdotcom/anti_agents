@@ -1,0 +1,5 @@
+{
+  "note": "Canonical placeholder fixture for rounds=1 frontier regression tests.",
+  "rounds": 1,
+  "archive_feedback": false
+}

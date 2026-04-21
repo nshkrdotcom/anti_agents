@@ -96,7 +96,7 @@ defmodule AntiAgents.Progress do
 
       state ->
         Agent.get_and_update(state, fn snapshot ->
-          updated = reduce_state(snapshot, event, metadata)
+          updated = reduce_state(snapshot, event, metadata, opts)
           {updated, updated}
         end)
     end
@@ -104,33 +104,96 @@ defmodule AntiAgents.Progress do
     _error -> nil
   end
 
-  defp reduce_state(state, event, metadata) do
+  defp reduce_state(state, event, metadata, opts) do
     state
-    |> apply_event(event, metadata)
+    |> apply_event(event, metadata, opts)
     |> Map.put(:last_event, event)
   end
 
-  defp apply_event(state, :run_plan, metadata) do
+  defp apply_event(state, :benchmark_plan, metadata, _opts) do
+    %{
+      state
+      | stage: :benchmark,
+        stage_detail: "benchmark planned",
+        llm_done: 0,
+        llm_total: metadata[:planned_llm_calls],
+        baseline_done: 0,
+        baseline_total: nil,
+        burst_done: 0,
+        burst_total: nil,
+        inflight: %{}
+    }
+  end
+
+  defp apply_event(state, :benchmark_run_start, metadata, _opts) do
+    %{
+      state
+      | stage: :benchmark,
+        stage_detail:
+          "benchmark run #{metadata[:run_index]}/#{metadata[:run_total]} field #{metadata[:field_index]}/#{metadata[:field_total]} #{metadata[:field_id]}",
+        llm_done: metadata[:llm_done] || state.llm_done,
+        llm_total: metadata[:llm_total] || state.llm_total,
+        baseline_done: 0,
+        baseline_total: nil,
+        burst_done: 0,
+        burst_total: nil,
+        inflight: %{}
+    }
+  end
+
+  defp apply_event(state, :benchmark_run_done, metadata, _opts) do
+    %{
+      state
+      | stage: :benchmark,
+        stage_detail: "benchmark run #{metadata[:run_index]}/#{metadata[:run_total]} complete",
+        llm_done: metadata[:llm_done] || state.llm_done,
+        llm_total: metadata[:llm_total] || state.llm_total,
+        inflight: %{}
+    }
+  end
+
+  defp apply_event(state, :run_plan, metadata, opts) do
+    matched_baseline_calls = metadata[:matched_baseline_calls] || 0
+    benchmark_total = Keyword.get(opts, :benchmark_llm_total)
+    benchmark_offset = Keyword.get(opts, :benchmark_llm_offset)
+    llm_total = benchmark_total || metadata[:total_llm_calls]
+    llm_done = if benchmark_total, do: benchmark_offset || state.llm_done, else: state.llm_done
+
     %{
       state
       | stage: :planned,
-        stage_detail: "plan announced",
-        llm_total: metadata[:total_llm_calls],
-        baseline_total: metadata[:baseline_calls],
+        stage_detail: benchmark_stage_detail(opts, "plan announced"),
+        llm_done: llm_done,
+        llm_total: llm_total,
+        baseline_done: 0,
+        baseline_total: (metadata[:baseline_calls] || 0) + matched_baseline_calls,
+        burst_done: 0,
         burst_total: metadata[:frontier_bursts]
     }
   end
 
-  defp apply_event(state, :baseline_start, metadata) do
+  defp apply_event(state, :baseline_start, metadata, _opts) do
+    total =
+      case {metadata[:methods], state.baseline_total} do
+        {methods, existing} when is_integer(methods) and is_integer(existing) ->
+          max(methods, existing)
+
+        {methods, _existing} when is_integer(methods) ->
+          methods
+
+        {_methods, existing} ->
+          existing
+      end
+
     %{
       state
       | stage: :baseline,
         stage_detail: "building reachable archive",
-        baseline_total: metadata[:methods] || state.baseline_total
+        baseline_total: total
     }
   end
 
-  defp apply_event(state, :frontier_start, metadata) do
+  defp apply_event(state, :frontier_start, metadata, _opts) do
     %{
       state
       | stage: :frontier,
@@ -139,67 +202,67 @@ defmodule AntiAgents.Progress do
     }
   end
 
-  defp apply_event(state, :baseline_call_start, metadata),
+  defp apply_event(state, :baseline_call_start, metadata, opts),
     do:
       put_inflight(
         state,
         {:baseline, metadata[:index]},
-        "baseline #{metadata[:index]}/#{metadata[:total]}"
+        inflight_label("baseline #{metadata[:index]}/#{metadata[:total]}", metadata, opts)
       )
 
-  defp apply_event(state, :burst_call_start, metadata),
+  defp apply_event(state, :burst_call_start, metadata, opts),
     do:
       put_inflight(
         state,
         {:burst, metadata[:index]},
-        "burst #{metadata[:index]}/#{metadata[:total]}"
+        inflight_label("burst #{metadata[:index]}/#{metadata[:total]}", metadata, opts)
       )
 
-  defp apply_event(state, :baseline_call_done, metadata) do
+  defp apply_event(state, :baseline_call_done, metadata, _opts) do
     state
     |> finish_inflight({:baseline, metadata[:index]})
     |> Map.update!(:baseline_done, &(&1 + 1))
     |> Map.update!(:llm_done, &(&1 + 1))
   end
 
-  defp apply_event(state, :baseline_call_error, metadata) do
+  defp apply_event(state, :baseline_call_error, metadata, _opts) do
     state
     |> finish_inflight({:baseline, metadata[:index]})
     |> Map.update!(:baseline_done, &(&1 + 1))
     |> Map.update!(:llm_done, &(&1 + 1))
   end
 
-  defp apply_event(state, :baseline_call_rejected, metadata) do
+  defp apply_event(state, :baseline_call_rejected, metadata, _opts) do
     state
     |> finish_inflight({:baseline, metadata[:index]})
     |> Map.update!(:baseline_done, &(&1 + 1))
     |> Map.update!(:llm_done, &(&1 + 1))
   end
 
-  defp apply_event(state, :burst_call_done, metadata) do
+  defp apply_event(state, :burst_call_done, metadata, _opts) do
     state
     |> finish_inflight({:burst, metadata[:index]})
     |> Map.update!(:burst_done, &(&1 + 1))
     |> Map.update!(:llm_done, &(&1 + 1))
   end
 
-  defp apply_event(state, :burst_call_error, metadata) do
+  defp apply_event(state, :burst_call_error, metadata, _opts) do
     state
     |> finish_inflight({:burst, metadata[:index]})
     |> Map.update!(:burst_done, &(&1 + 1))
     |> Map.update!(:llm_done, &(&1 + 1))
   end
 
-  defp apply_event(state, :frontier_report_done, _metadata),
+  defp apply_event(state, :frontier_report_done, _metadata, _opts),
     do: %{state | stage: :reporting, stage_detail: "scoring archive"}
 
-  defp apply_event(state, :trace_written, _metadata),
+  defp apply_event(state, :trace_written, _metadata, _opts),
     do: %{state | stage: :done, stage_detail: "trace written"}
 
-  defp apply_event(state, :mix_frontier_done, _metadata),
+  defp apply_event(state, :mix_frontier_done, _metadata, _opts),
     do: %{state | stage: :done, stage_detail: "done"}
 
-  defp apply_event(state, _event, _metadata), do: state
+  defp apply_event(state, _event, _metadata, _opts), do: state
 
   defp put_inflight(state, key, label) do
     started_at = System.monotonic_time(:millisecond)
@@ -234,8 +297,22 @@ defmodule AntiAgents.Progress do
     "Starting frontier run | field=#{inspect(preview(metadata[:field], 100))} | model=#{metadata[:model]} | reasoning=#{metadata[:reasoning_effort]} | dry_run=#{metadata[:dry_run]}"
   end
 
-  defp message(:run_plan, metadata, _snapshot, _opts) do
-    "Plan: #{metadata[:total_llm_calls]} LLM calls = #{metadata[:baseline_calls]} baseline + #{metadata[:frontier_bursts]} frontier bursts, concurrency=#{metadata[:concurrency]}. Baseline maps what ordinary prompting can reach; frontier keeps SSoT bursts that land outside that map."
+  defp message(:benchmark_plan, metadata, _snapshot, _opts) do
+    "Benchmark plan: #{metadata[:field_count]} fields × #{metadata[:repetitions]} repetitions = #{metadata[:run_count]} runs, #{metadata[:planned_llm_calls]} planned LLM calls, #{metadata[:calls_per_run]} calls/run."
+  end
+
+  defp message(:benchmark_run_start, metadata, _snapshot, _opts) do
+    "Benchmark run #{metadata[:run_index]}/#{metadata[:run_total]} | field #{metadata[:field_index]}/#{metadata[:field_total]} #{metadata[:field_id]} | repetition #{metadata[:repetition]}/#{metadata[:repetitions]} | completed_llm=#{metadata[:llm_done]}/#{metadata[:llm_total]} | this_run_calls=#{metadata[:calls_this_run]}"
+  end
+
+  defp message(:benchmark_run_done, metadata, _snapshot, _opts) do
+    "Benchmark run #{metadata[:run_index]}/#{metadata[:run_total]} done | field=#{metadata[:field_id]} | completed_llm=#{metadata[:llm_done]}/#{metadata[:llm_total]} | accepted=#{metadata[:accepted]} | adjusted_novel_frontier_cells=#{metadata[:adjusted_novel_frontier_cell_count]}"
+  end
+
+  defp message(:run_plan, metadata, _snapshot, opts) do
+    matched = metadata[:matched_baseline_calls] || 0
+
+    "#{benchmark_context(opts)}Plan: #{metadata[:total_llm_calls]} LLM calls = #{metadata[:baseline_calls]} baseline + #{metadata[:frontier_bursts]} frontier bursts + #{matched} matched-baseline continuation, concurrency=#{metadata[:concurrency]}. Baseline maps what ordinary prompting can reach; frontier keeps SSoT bursts that land outside that map."
   end
 
   defp message(:compare_start, metadata, _snapshot, _opts) do
@@ -247,23 +324,27 @@ defmodule AntiAgents.Progress do
   end
 
   defp message(:baseline_call_start, metadata, _snapshot, opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} started | #{method_reason(metadata[:method])} | input=#{inspect(preview(metadata[:input_preview], preview_limit(opts)))}"
+    "#{llm_label(metadata, opts)} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} started | #{method_reason(metadata[:method])} | input=#{inspect(preview(metadata[:input_preview], preview_limit(opts)))}"
   end
 
   defp message(:baseline_call_done, metadata, snapshot, opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} done in #{duration(snapshot)} | output_chars=#{metadata[:answer_length]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
+    "#{llm_label(metadata, opts)} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} done in #{duration(snapshot)} | output_chars=#{metadata[:answer_length]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
   end
 
-  defp message(:baseline_call_error, metadata, snapshot, _opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
+  defp message(:baseline_call_error, metadata, snapshot, opts) do
+    "#{llm_label(metadata, opts)} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
   end
 
   defp message(:baseline_call_rejected, metadata, snapshot, opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} rejected from reachable archive in #{duration(snapshot)} | reason=#{metadata[:reason]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
+    "#{llm_label(metadata, opts)} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} rejected from reachable archive in #{duration(snapshot)} | reason=#{metadata[:reason]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
+  end
+
+  defp message(:baseline_call_retry, metadata, _snapshot, opts) do
+    "#{llm_label(metadata, opts)} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} retrying #{metadata[:attempt]}/#{metadata[:retry_budget]} after artifact | reason=#{metadata[:reason]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
   end
 
   defp message(:baseline_done, metadata, _snapshot, _opts) do
-    "Baseline archive complete | accepted=#{metadata[:accepted]}. Next: run frontier bursts against this reachable map."
+    "Baseline archive complete | accepted=#{metadata[:accepted]} | retries=#{metadata[:retry_count] || 0} | permanent_losses=#{metadata[:permanent_loss_count] || 0}. Next: run frontier bursts against this reachable map."
   end
 
   defp message(:frontier_start, metadata, _snapshot, _opts) do
@@ -275,15 +356,15 @@ defmodule AntiAgents.Progress do
   end
 
   defp message(:burst_call_start, metadata, _snapshot, opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} burst #{metadata[:index]}/#{metadata[:total]} started | model=#{metadata[:model]} temp=#{metadata[:temperature]} | asks for random_string + mapping JSON + answer | input=#{inspect(preview(metadata[:input_preview], preview_limit(opts)))}"
+    "#{llm_label(metadata, opts)} burst #{metadata[:index]}/#{metadata[:total]} started | model=#{metadata[:model]} temp=#{metadata[:temperature]} | asks for random_string + mapping JSON + answer | input=#{inspect(preview(metadata[:input_preview], preview_limit(opts)))}"
   end
 
   defp message(:burst_call_done, metadata, snapshot, opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} burst #{metadata[:index]}/#{metadata[:total]} #{metadata[:status]} in #{duration(snapshot)} | seed_coverage=#{metadata[:seed_coverage]} | answer_chars=#{metadata[:answer_length]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
+    "#{llm_label(metadata, opts)} burst #{metadata[:index]}/#{metadata[:total]} #{metadata[:status]} in #{duration(snapshot)} | seed_coverage=#{metadata[:seed_coverage]} | answer_chars=#{metadata[:answer_length]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
   end
 
-  defp message(:burst_call_error, metadata, snapshot, _opts) do
-    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} burst #{metadata[:index]}/#{metadata[:total]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
+  defp message(:burst_call_error, metadata, snapshot, opts) do
+    "#{llm_label(metadata, opts)} burst #{metadata[:index]}/#{metadata[:total]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
   end
 
   defp message(:branch_done, metadata, _snapshot, _opts) do
@@ -317,6 +398,64 @@ defmodule AntiAgents.Progress do
   defp method_reason("seed_injection"), do: "external seed-injection baseline"
   defp method_reason("temperature:" <> temp), do: "temperature sweep baseline at #{temp}"
   defp method_reason(_method), do: "baseline method"
+
+  defp llm_label(metadata, opts) do
+    local = "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]}"
+
+    case Keyword.get(opts, :benchmark_run_index) do
+      nil ->
+        local
+
+      run_index ->
+        global_done = Keyword.get(opts, :benchmark_llm_offset, 0) + metadata[:llm_index]
+        global_total = Keyword.get(opts, :benchmark_llm_total, metadata[:llm_total])
+        run_total = Keyword.get(opts, :benchmark_run_total)
+        field_id = Keyword.get(opts, :benchmark_field_id)
+
+        "benchmark run #{run_index}/#{run_total} field=#{field_id} | LLM #{global_done}/#{global_total} | local #{local}"
+    end
+  end
+
+  defp inflight_label(local_label, metadata, opts) do
+    case Keyword.get(opts, :benchmark_run_index) do
+      nil ->
+        local_label
+
+      run_index ->
+        global_done = Keyword.get(opts, :benchmark_llm_offset, 0) + metadata[:llm_index]
+        global_total = Keyword.get(opts, :benchmark_llm_total, metadata[:llm_total])
+        run_total = Keyword.get(opts, :benchmark_run_total)
+        field_id = Keyword.get(opts, :benchmark_field_id)
+
+        "benchmark run #{run_index}/#{run_total} field=#{field_id} LLM #{global_done}/#{global_total} #{local_label}"
+    end
+  end
+
+  defp benchmark_context(opts) do
+    case Keyword.get(opts, :benchmark_run_index) do
+      nil ->
+        ""
+
+      run_index ->
+        run_total = Keyword.get(opts, :benchmark_run_total)
+        field_id = Keyword.get(opts, :benchmark_field_id)
+        "benchmark run #{run_index}/#{run_total} field=#{field_id} | "
+    end
+  end
+
+  defp benchmark_stage_detail(opts, fallback) do
+    case Keyword.get(opts, :benchmark_run_index) do
+      nil ->
+        fallback
+
+      run_index ->
+        run_total = Keyword.get(opts, :benchmark_run_total)
+        field_index = Keyword.get(opts, :benchmark_field_index)
+        field_total = Keyword.get(opts, :benchmark_field_total)
+        field_id = Keyword.get(opts, :benchmark_field_id)
+        "benchmark run #{run_index}/#{run_total} field #{field_index}/#{field_total} #{field_id}"
+    end
+  end
 
   defp duration(%{last_duration_ms: ms}) when is_integer(ms), do: "#{Float.round(ms / 1000, 1)}s"
   defp duration(_snapshot), do: "?"

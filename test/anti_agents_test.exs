@@ -4,7 +4,8 @@ defmodule AntiAgentsTest do
   import ExUnit.CaptureIO
 
   alias AntiAgents.{BurstResult, Field, FrontierReport}
-  alias AntiAgents.{Bursts, Progress, Scoring}
+  alias AntiAgents.{Bursts, Progress, Scoring, Statistics}
+  alias Mix.Tasks.AntiAgents.Benchmark, as: BenchmarkTask
   alias Mix.Tasks.AntiAgents.Frontier, as: FrontierTask
 
   defmodule FakeOptions do
@@ -239,6 +240,28 @@ defmodule AntiAgentsTest do
         end)
 
       {:ok, response}
+    end
+  end
+
+  defmodule RecordingQueueClient do
+    def complete(prompt, opts) do
+      send(opts[:test_pid], {:recorded_prompt, prompt})
+      QueueClient.complete(prompt, opts)
+    end
+  end
+
+  defmodule StubEmbeddingClient do
+    def embed(texts, _opts) do
+      vectors =
+        Enum.map(texts, fn text ->
+          if String.contains?(text, "cat") do
+            [1.0, 0.0, 0.0]
+          else
+            [0.0, 1.0, 0.0]
+          end
+        end)
+
+      {:ok, vectors}
     end
   end
 
@@ -490,6 +513,92 @@ defmodule AntiAgentsTest do
   end
 
   describe "compare/2 and frontier/2" do
+    test "distance backends expose jaccard, embedding, and judge paths" do
+      assert AntiAgents.Distance.Jaccard.pairwise("the cat sat", "the cat sat", []) ==
+               {:ok, 1.0}
+
+      assert {:ok, similarity} =
+               AntiAgents.Distance.Embedding.pairwise("cat", "cat again",
+                 embedding_client: StubEmbeddingClient
+               )
+
+      assert similarity > 0.99
+
+      assert {:ok, different} =
+               AntiAgents.Distance.Embedding.pairwise("cat", "ocean",
+                 embedding_client: StubEmbeddingClient
+               )
+
+      assert different < 0.1
+
+      assert {:error, :judge_backend_not_configured} =
+               AntiAgents.Distance.Judge.pairwise("a", "b", [])
+    end
+
+    test "fit_centroids is idempotent when k covers unique inputs" do
+      inputs = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+
+      assert Scoring.fit_centroids(inputs, 4) == [[1.0, 0.0], [0.0, 1.0]]
+      assert Scoring.fit_centroids(inputs, 2) == [[1.0, 0.0], [0.0, 1.0]]
+    end
+
+    test "scoring weights sum to one and match documented components" do
+      weights = Scoring.score_weights()
+
+      assert Map.keys(weights) |> Enum.sort() ==
+               [:baseline_distance, :coherence, :frontier_distance, :seed_coverage]
+
+      assert_in_delta weights |> Map.values() |> Enum.sum(), 1.0, 0.0001
+      assert weights.baseline_distance == 0.50
+      assert weights.frontier_distance == 0.25
+      assert weights.seed_coverage == 0.15
+      assert weights.coherence == 0.10
+    end
+
+    test "statistics count distinct cells and recover bootstrap CI for a known mean" do
+      bursts = [
+        %BurstResult{descriptor: %{cell: %{length: :short}}},
+        %BurstResult{descriptor: %{cell: %{length: :short}}},
+        %BurstResult{descriptor: %{cell: %{length: :long}}}
+      ]
+
+      assert Statistics.distinct_cell_count(bursts) == 2
+
+      sample = Enum.to_list(1..100)
+      mean = fn values -> Enum.sum(values) / length(values) end
+
+      {lo, hi} =
+        Statistics.bootstrap_ci(sample, mean, resamples: 2000, confidence: 0.95, seed: 11)
+
+      assert lo < 50.5
+      assert hi > 50.5
+      assert_in_delta lo, 44.9, 2.5
+      assert_in_delta hi, 56.1, 2.5
+    end
+
+    test "bootstrap hypothesis test compares frontier against matched baseline cells" do
+      frontier = [
+        %BurstResult{descriptor: %{cell: %{length: :short}}},
+        %BurstResult{descriptor: %{cell: %{length: :medium}}},
+        %BurstResult{descriptor: %{cell: %{length: :long}}}
+      ]
+
+      matched = [
+        %BurstResult{descriptor: %{cell: %{length: :short}}},
+        %BurstResult{descriptor: %{cell: %{length: :short}}},
+        %BurstResult{descriptor: %{cell: %{length: :short}}}
+      ]
+
+      test = Statistics.hypothesis_test(frontier, matched, resamples: 500, seed: 7)
+
+      assert test.delta_distinct_cells == 2
+      assert test.frontier_cell_count == 3
+      assert test.matched_baseline_cell_count == 1
+      assert is_boolean(test.rejects_null)
+      assert [lo, hi] = test.bootstrap_ci_95
+      assert lo <= hi
+    end
+
     test "frontier report has explicit fields" do
       field = AntiAgents.field("field for frontier", axes: [:ontology, :metaphor])
 
@@ -497,6 +606,7 @@ defmodule AntiAgentsTest do
         client: FrontierClient,
         branching: 3,
         baseline: [:plain],
+        matched_budget: false,
         heat: [answer: 1.0],
         coordinate: [length: 12, chunk: 3]
       ]
@@ -522,6 +632,7 @@ defmodule AntiAgentsTest do
         AntiAgents.compare(
           field,
           baseline: [:plain],
+          matched_budget: false,
           branching: 2,
           client: FrontierClient,
           heat: [answer: 1.0]
@@ -551,6 +662,7 @@ defmodule AntiAgentsTest do
       ssot_cell = Scoring.descriptor(answer, mapping, "abcdef123456", 3).cell
 
       assert baseline_cell == ssot_cell
+      assert baseline_cell.semantic_cluster == :unknown
     end
 
     test "frontier metrics use set difference against reachable cells" do
@@ -578,6 +690,7 @@ defmodule AntiAgentsTest do
       report =
         AntiAgents.frontier(field,
           baseline: [:plain],
+          matched_budget: false,
           branching: 2,
           client: QueueClient,
           client_opts: [queue: queue],
@@ -620,6 +733,7 @@ defmodule AntiAgentsTest do
       report =
         AntiAgents.frontier(field,
           baseline: [:plain],
+          matched_budget: false,
           branching: 2,
           client: QueueClient,
           client_opts: [queue: queue],
@@ -635,11 +749,88 @@ defmodule AntiAgentsTest do
              )
     end
 
+    test "baseline artifact is retried and accepted without permanent loss" do
+      {:ok, queue} =
+        Agent.start_link(fn ->
+          [
+            "```json\n{\"mode\":\"dry_run\",\"exemplars\":[]}\n```",
+            "Clean retry baseline answer.",
+            AntiAgentsTest.valid_burst_json(
+              "retry-frontier-seed",
+              "A frontier answer with a separate descriptor cell. It has a second sentence.",
+              axes: ["ontology", "metaphor", "closure"],
+              chunks: [0, 1, 2],
+              chunk_size: 4
+            )
+          ]
+        end)
+
+      field = AntiAgents.field("baseline retry", axes: [:ontology, :metaphor, :closure])
+
+      report =
+        AntiAgents.frontier(field,
+          baseline: [:plain],
+          matched_budget: false,
+          branching: 1,
+          client: QueueClient,
+          client_opts: [queue: queue],
+          concurrency: 1,
+          baseline_retry_budget: 2,
+          coordinate: [length: 16, chunk: 4]
+        )
+
+      assert length(report.reachable_archive) == 1
+      assert hd(report.reachable_archive).answer == "Clean retry baseline answer."
+      assert report.baseline_retry_count == 1
+      assert report.baseline_permanent_loss_count == 0
+      assert report.baseline_loss_adjustment == 0.0
+      assert report.adjusted_novel_frontier_cell_count == report.novel_frontier_cell_count * 1.0
+    end
+
+    test "exhausted baseline artifact retries record permanent loss and adjusted novelty" do
+      {:ok, queue} =
+        Agent.start_link(fn ->
+          [
+            "```json\n{\"mode\":\"dry_run\",\"exemplars\":[]}\n```",
+            "```json\n{\"mode\":\"dry_run\",\"exemplars\":[]}\n```",
+            "```json\n{\"mode\":\"dry_run\",\"exemplars\":[]}\n```",
+            AntiAgentsTest.valid_burst_json(
+              "lost-frontier-seed",
+              "A frontier answer survives despite the missing baseline archive. It has a second sentence.",
+              axes: ["ontology", "metaphor", "closure"],
+              chunks: [0, 1, 2],
+              chunk_size: 4
+            )
+          ]
+        end)
+
+      field = AntiAgents.field("baseline loss", axes: [:ontology, :metaphor, :closure])
+
+      report =
+        AntiAgents.frontier(field,
+          baseline: [:plain],
+          matched_budget: false,
+          branching: 1,
+          client: QueueClient,
+          client_opts: [queue: queue],
+          concurrency: 1,
+          baseline_retry_budget: 2,
+          coordinate: [length: 16, chunk: 4]
+        )
+
+      assert report.baseline_retry_count == 2
+      assert report.baseline_permanent_loss_count == 1
+      assert report.baseline_loss_adjustment == 1.0
+      assert report.adjusted_novel_frontier_cell_count == 0.0
+      assert report.adjusted_novel_frontier_cell_count <= report.novel_frontier_cell_count
+    end
+
     test "baseline calls use a clean non-SSoT contract except explicit seed injection" do
       field = AntiAgents.field("field for clean baselines")
 
       AntiAgents.compare(field,
         baseline: [:plain, :paraphrase, {:temperature, [1.0]}, :seed_injection],
+        matched_budget: false,
         branching: 1,
         client: ContractClient,
         client_opts: [test_pid: self()],
@@ -676,6 +867,73 @@ defmodule AntiAgentsTest do
 
       assert {_prompt, seed_opts} = seed_injection
       assert String.contains?(seed_opts[:input], "Seed: fixed-seed")
+    end
+
+    test "archive feedback adds steering to later frontier rounds" do
+      {:ok, queue} =
+        Agent.start_link(fn ->
+          [
+            "Baseline answer.",
+            AntiAgentsTest.valid_burst_json(
+              "round-one-seed",
+              "First round frontier answer with enough structure. It has two sentences.",
+              axes: ["ontology", "metaphor", "closure"],
+              chunks: [0, 1, 2],
+              chunk_size: 4
+            ),
+            AntiAgentsTest.valid_burst_json(
+              "round-two-seed",
+              "Second round frontier answer with different structure. It also has two sentences.",
+              axes: ["ontology", "metaphor", "closure"],
+              chunks: [0, 1, 2],
+              chunk_size: 4
+            )
+          ]
+        end)
+
+      field = AntiAgents.field("feedback rounds", axes: [:ontology, :metaphor, :closure])
+
+      report =
+        AntiAgents.frontier(field,
+          baseline: [:plain],
+          branching: 1,
+          rounds: 2,
+          matched_budget: false,
+          client: RecordingQueueClient,
+          client_opts: [queue: queue, test_pid: self()],
+          concurrency: 1,
+          coordinate: [length: 16, chunk: 4]
+        )
+
+      assert report.rounds == 2
+      assert length(report.round_summaries) == 2
+      assert report.stagnation_at_round == nil
+
+      prompts = collect_recorded_prompts(3)
+
+      frontier_prompts =
+        Enum.filter(prompts, &String.contains?(&1, "Produce exactly one exploration"))
+
+      assert length(frontier_prompts) == 2
+      assert Enum.at(frontier_prompts, 1) =~ "Archive feedback"
+    end
+
+    test "frontier records stagnation when a round has no accepted bursts" do
+      field = AntiAgents.field("stagnation", axes: [:ontology, :metaphor])
+
+      report =
+        AntiAgents.frontier(field,
+          baseline: [],
+          branching: 1,
+          rounds: 3,
+          matched_budget: false,
+          client: PrefixRejectClient,
+          concurrency: 1,
+          coordinate: [length: 12, chunk: 4]
+        )
+
+      assert report.stagnation_at_round == 1
+      assert [%{round: 1, accepted: 0}] = report.round_summaries
     end
 
     test "baseline calls are parallelized independently from frontier bursts" do
@@ -849,6 +1107,23 @@ defmodule AntiAgentsTest do
       refute Scoring.artifact_answer?("plain ordinary answer")
     end
 
+    test "recorded fixtures accept and reject according to host verification" do
+      valid = "test/support/fixtures/burst_valid.json" |> File.read!() |> Jason.decode!()
+      prefix = "test/support/fixtures/burst_prefix_only.json" |> File.read!() |> Jason.decode!()
+
+      valid_verification = Scoring.verify_mapping(valid["mapping"], valid["random_string"], 4)
+      prefix_verification = Scoring.verify_mapping(prefix["mapping"], prefix["random_string"], 4)
+
+      assert valid_verification.valid? == true
+      refute Scoring.verified_anti_collapse_fail?(valid_verification)
+
+      assert prefix_verification.valid? == true
+      assert Scoring.verified_anti_collapse_fail?(prefix_verification)
+
+      assert Scoring.clean_plain_answer(File.read!("test/support/fixtures/baseline_artifact.txt")) ==
+               {:error, :artifact_answer}
+    end
+
     test "verify_mapping reports non-map, invalid axis, and invalid chunk cases" do
       assert Scoring.verify_mapping("bad", "abcdef", 3).valid? == false
 
@@ -980,6 +1255,10 @@ defmodule AntiAgentsTest do
                  "40",
                  "--chunk",
                  "4",
+                 "--baseline-retry-budget",
+                 "3",
+                 "--distance",
+                 "jaccard",
                  "--baseline",
                  "plain,paraphrase,temp:0.8|1.0",
                  "--toward",
@@ -995,6 +1274,10 @@ defmodule AntiAgentsTest do
       assert opts[:branching] == 12
       assert opts[:coordinate][:length] == 40
       assert opts[:coordinate][:chunk] == 4
+      assert opts[:baseline_retry_budget] == 3
+      assert opts[:matched_budget] == true
+      assert opts[:bootstrap_resamples] == 2_000
+      assert opts[:distance] == :jaccard
       assert opts[:model] == "gpt-5.4-mini"
       assert opts[:reasoning_effort] == :low
       assert opts[:heat][:answer] == 1.18
@@ -1128,6 +1411,118 @@ defmodule AntiAgentsTest do
       File.rm("tmp/test_dry_run_trace.json")
     end
 
+    test "mix benchmark dry-run reports fields, repetitions, and planned calls" do
+      Mix.Task.reenable("anti_agents.benchmark")
+      path = "tmp/test_fields.json"
+
+      File.write!(
+        path,
+        Jason.encode!([
+          %{"id" => "a", "prompt" => "field a", "axes" => ["ontology"]},
+          %{"id" => "b", "prompt" => "field b", "axes" => ["syntax"]}
+        ])
+      )
+
+      output =
+        capture_io(fn ->
+          BenchmarkTask.run([
+            "--fields",
+            path,
+            "--dry-run",
+            "--branching",
+            "2",
+            "--repetitions",
+            "3",
+            "--baseline",
+            "plain,paraphrase"
+          ])
+        end)
+
+      assert output =~ "\"mode\": \"benchmark_dry_run\""
+      assert output =~ "\"field_count\": 2"
+      assert output =~ "\"repetitions\": 3"
+      assert output =~ "\"planned_llm_calls\": 36"
+      assert output =~ "\"fields_sha256\""
+    after
+      File.rm("tmp/test_fields.json")
+    end
+
+    test "benchmark verbose progress reports global run and LLM position" do
+      output =
+        capture_io(:stderr, fn ->
+          Progress.with_heartbeat(
+            [verbose: true, heartbeat_ms: 50, preview_chars: 60],
+            :benchmark_test,
+            fn opts ->
+              opts =
+                Keyword.merge(opts,
+                  benchmark_run_index: 6,
+                  benchmark_run_total: 12,
+                  benchmark_field_index: 6,
+                  benchmark_field_total: 12,
+                  benchmark_field_id: "city-forget",
+                  benchmark_llm_offset: 15,
+                  benchmark_llm_total: 36
+                )
+
+              Progress.event(opts, :benchmark_plan, %{
+                field_count: 12,
+                repetitions: 1,
+                run_count: 12,
+                planned_llm_calls: 36,
+                calls_per_run: 3
+              })
+
+              Progress.event(opts, :benchmark_run_start, %{
+                run_index: 6,
+                run_total: 12,
+                field_index: 6,
+                field_total: 12,
+                field_id: "city-forget",
+                repetition: 1,
+                repetitions: 1,
+                llm_done: 15,
+                llm_total: 36,
+                calls_this_run: 3
+              })
+
+              Progress.event(opts, :run_plan, %{
+                baseline_calls: 1,
+                frontier_bursts: 1,
+                matched_baseline_calls: 1,
+                total_llm_calls: 3,
+                concurrency: 4
+              })
+
+              Progress.event(opts, :baseline_call_start, %{
+                index: 1,
+                total: 1,
+                llm_index: 1,
+                llm_total: 3,
+                method: "plain",
+                input_preview: "city field"
+              })
+
+              Progress.event(opts, :heartbeat, %{
+                label: :benchmark_test,
+                elapsed_ms: 5_000,
+                tick: 1
+              })
+            end
+          )
+        end)
+
+      assert output =~ "Benchmark plan: 12 fields × 1 repetitions = 12 runs"
+      assert output =~ "36 planned LLM calls"
+      assert output =~ "Benchmark run 6/12 | field 6/12 city-forget"
+      assert output =~ "completed_llm=15/36"
+      assert output =~ "benchmark run 6/12 field=city-forget | Plan: 3 LLM calls"
+      assert output =~ "benchmark run 6/12 field=city-forget | LLM 16/36"
+      assert output =~ "local LLM 1/3 baseline 1/1 plain started"
+      assert output =~ "stage=benchmark run 6/12 field 6/12 city-forget; LLM 15/36"
+      assert output =~ "inflight=benchmark run 6/12 field=city-forget LLM 16/36 baseline 1/1"
+    end
+
     test "heartbeat progress can be observed during long live runs" do
       test_pid = self()
 
@@ -1236,6 +1631,18 @@ defmodule AntiAgentsTest do
                 output_preview: "bad"
               })
 
+              Progress.event(opts, :baseline_call_retry, %{
+                index: 1,
+                total: 1,
+                llm_index: 1,
+                llm_total: 2,
+                method: "seed_injection",
+                attempt: 1,
+                retry_budget: 2,
+                reason: "artifact",
+                output_preview: "bad"
+              })
+
               Progress.event(opts, :baseline_call_start, %{
                 index: 2,
                 total: 2,
@@ -1324,6 +1731,7 @@ defmodule AntiAgentsTest do
       assert output =~ "temperature:0.7 failed"
       assert output =~ "Baseline archive complete"
       assert output =~ "rejected from reachable archive"
+      assert output =~ "retrying"
       assert output =~ "Stage 2/3 frontier exploration"
       assert output =~ "failed"
       assert output =~ "accepted"
@@ -1358,6 +1766,18 @@ defmodule AntiAgentsTest do
         reachable_cell_count: 1,
         novel_frontier_cell_count: 1,
         coverage_delta: 0.5,
+        baseline_retry_count: 1,
+        baseline_permanent_loss_count: 0,
+        baseline_loss_adjustment: 0.0,
+        adjusted_novel_frontier_cell_count: 1.0,
+        hypothesis_test: %{
+          delta_distinct_cells: 1,
+          bootstrap_ci_95: [1.0, 1.0],
+          rejects_null: true,
+          matched_baseline_cell_count: 0,
+          frontier_cell_count: 1,
+          n_resamples: 0
+        },
         mapping_traces: [burst.mapping_trace],
         metrics: %{distinct: 1, coherence: 0.8, seed_coverage: 0.5, archive_coverage: 1.0}
       }
@@ -1366,14 +1786,25 @@ defmodule AntiAgentsTest do
 
       assert trace["synthesis"]["essential_aspect"] =~ "entropy-first"
       assert trace["run"]["model"] == "gpt-5.4-mini"
-      assert trace["evidence"]["meaningful_signal"] == true
+      refute Map.has_key?(trace["evidence"], "meaningful_signal")
       assert trace["evidence"]["reachable_baseline_count"] == 1
       assert trace["evidence"]["novel_frontier_cell_count"] == 1
       assert trace["evidence"]["coverage_delta"] == 0.5
+      assert trace["evidence"]["baseline_retry_count"] == 1
+      assert trace["evidence"]["baseline_permanent_loss_count"] == 0
+      assert trace["evidence"]["baseline_loss_adjustment"] == 0.0
+      assert trace["evidence"]["adjusted_novel_frontier_cell_count"] == 1.0
+      assert trace["evidence"]["hypothesis_test"]["rejects_null"] == true
       assert length(trace["reachable_archive"]) == 1
       assert hd(trace["exemplars"])["random_string"] == "abcdef123456"
       assert hd(trace["exemplars"])["mapping_verification"]["valid?"] == true
       refute Map.has_key?(hd(trace["exemplars"]), "raw_output")
+
+      schema = "priv/schemas/trace_v2.json" |> File.read!() |> Jason.decode!()
+      assert Enum.all?(schema["required"], &Map.has_key?(trace, &1))
+
+      evidence_required = schema["properties"]["evidence"]["required"]
+      assert Enum.all?(evidence_required, &Map.has_key?(trace["evidence"], &1))
     end
   end
 
@@ -1428,6 +1859,20 @@ defmodule AntiAgentsTest do
     after
       500 ->
         flunk("expected #{count} more client calls")
+    end
+  end
+
+  defp collect_recorded_prompts(count), do: collect_recorded_prompts(count, [])
+
+  defp collect_recorded_prompts(0, acc), do: Enum.reverse(acc)
+
+  defp collect_recorded_prompts(count, acc) do
+    receive do
+      {:recorded_prompt, prompt} ->
+        collect_recorded_prompts(count - 1, [prompt | acc])
+    after
+      500 ->
+        flunk("expected #{count} more recorded prompts")
     end
   end
 

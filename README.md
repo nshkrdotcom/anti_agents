@@ -134,28 +134,30 @@ testable:
 
 The harness adopts a concrete and falsifiable hypothesis:
 
-> For a fixed field and an equal attempted baseline/frontier budget, verified
-> SSoT bursts should produce at least one descriptor cell that is not occupied
-> by the reachable baseline archive, while maintaining mean verified seed
-> coverage above `0.5`.
+> Across a fixed field set, SSoT frontier bursts should produce more distinct
+> descriptor cells than an equal-size matched-baseline continuation. The null
+> hypothesis is `E[delta_distinct_cells] <= 0`; the benchmark rejects the null
+> only when the bootstrap-resampled 95% lower bound is strictly positive.
 
-The principal reported statistic is `novel_frontier_cell_count`, defined as:
+The single-run accounting still reports `novel_frontier_cell_count`, but the
+benchmark statistic is stricter:
 
 ```text
 reachable_cells = unique_descriptor_cells(accepted_baselines)
 frontier_cells = unique_descriptor_cells(accepted_frontier)
+matched_cells = unique_descriptor_cells(matched_baseline_continuation)
 
 novel_frontier_cell_count = |frontier_cells \ reachable_cells|
+delta_distinct_cells = |frontier_cells| - |matched_cells|
 ```
 
-A positive value does not by itself constitute a paper-level result. It is a
-live-run signal that the current field, prompt contract, model, temperature,
-and archive descriptors produced frontier cells beyond the reachable baseline
-set. The descriptor cell is deliberately coarse — `{length, sentence_count,
-affect, abstraction}` — and verified seed usage, although measured and scored,
-is intentionally excluded from cell identity.
+A positive `novel_frontier_cell_count` is a pilot signal. A positive benchmark
+claim requires `evidence.hypothesis_test.rejects_null == true` after baseline
+loss adjustment.
 
 ## Live result
+
+### Pilot
 
 The most recent hardening pass executed a small live Codex experiment using
 the following command:
@@ -196,8 +198,7 @@ one was rejected because its descriptor cell was already reachable.
   "coverage_delta": 0.971,
   "invalid_mapping_count": 0,
   "schema_rejected_count": 0,
-  "duplicate_random_string_count": 0,
-  "meaningful_signal": true
+  "duplicate_random_string_count": 0
 }
 ```
 
@@ -218,6 +219,77 @@ space is coarse, the default distance backend is lexical, and the experiment
 is not a NoveltyBench reproduction. The result should be read as demonstrating
 that the harness is experimentally usable and has generated a positive pilot
 signal, rather than as establishing frontier search under SSoT.
+
+### Benchmark
+
+The benchmark harness is now the primary evidence path:
+
+```bash
+mix anti_agents.benchmark \
+  --fields priv/benchmarks/fields_v1.json \
+  --branching 8 \
+  --repetitions 3 \
+  --distance jaccard \
+  --out tmp/anti_agents_benchmark.json
+```
+
+Run the dry plan first:
+
+```bash
+mix anti_agents.benchmark --fields priv/benchmarks/fields_v1.json --dry-run
+```
+
+The default 12-field, 3-repetition plan reports:
+
+```json
+{
+  "field_count": 12,
+  "repetitions": 3,
+  "baseline_calls_per_run": 6,
+  "frontier_bursts_per_run": 8,
+  "matched_baseline_calls_per_run": 8,
+  "planned_llm_calls": 792,
+  "mode": "benchmark_dry_run"
+}
+```
+
+The live benchmark report writes `evidence.hypothesis_test.rejects_null` as a
+boolean. A `false` value is a valid empirical result and should be reported, not
+suppressed.
+
+For live benchmark runs, use verbose mode when collecting evidence:
+
+```bash
+mix anti_agents.benchmark \
+  --fields priv/benchmarks/fields_v1.json \
+  --branching 1 \
+  --repetitions 1 \
+  --baseline plain \
+  --model gpt-5.4-mini \
+  --reasoning low \
+  --temperature 1.05 \
+  --bootstrap-resamples 200 \
+  --timeout-ms 240000 \
+  --verbose \
+  --heartbeat-ms 5000 \
+  --preview-chars 180 \
+  --out tmp/anti_agents_benchmark_smoke.json
+```
+
+Verbose benchmark logs intentionally report both global and local progress:
+
+```text
+Benchmark plan: 12 fields × 1 repetitions = 12 runs, 36 planned LLM calls, 3 calls/run.
+Benchmark run 6/12 | field 6/12 city-forget | repetition 1/1 | completed_llm=15/36 | this_run_calls=3
+benchmark run 6/12 field=city-forget | Plan: 3 LLM calls = 1 baseline + 1 frontier bursts + 1 matched-baseline continuation, concurrency=24.
+benchmark run 6/12 field=city-forget | LLM 16/36 | local LLM 1/3 baseline 1/1 plain started
+Still running after 5.0s | stage=benchmark run 6/12 field 6/12 city-forget; LLM 15/36; baseline 0/2; bursts 0/1 | inflight=benchmark run 6/12 field=city-forget LLM 16/36 baseline 1/1 5.0s
+```
+
+The local `1/3` counter describes the current field-level run; the global
+`16/36` counter describes the whole benchmark. This distinction matters because
+the benchmark repeats the same three-stage frontier comparison across every
+field and repetition.
 
 ## Mechanism
 
@@ -252,9 +324,17 @@ demonstration code:
 - Artefact guards reject prompt echoes, nested control JSON, malformed
   `random_string` or `mapping` payloads, code-fenced output, and SDK/CLI
   tutorial responses before such content can enter either archive.
+- Baseline artefacts are retried up to `--baseline-retry-budget`; permanent
+  losses are debited through `adjusted_novel_frontier_cell_count`.
 - Random-string guards reject nonce copying, excessively short strings,
   highly repetitive strings, and duplicate model-generated random strings
   observed within a single frontier run.
+- `--rounds N` enables archive-feedback rounds. Later frontier rounds receive a
+  short steering delta derived only from accepted archive occupancy; if a round
+  produces no accepted bursts, the run records `stagnation_at_round`.
+- `--matched-budget` adds an equal-size baseline continuation after frontier
+  generation. The benchmark compares distinct cells from this continuation
+  against distinct frontier cells with a bootstrap confidence interval.
 
 ## Experimental trace
 
@@ -271,9 +351,12 @@ debugging. The trace contains:
 - `rejected_duplicates` — bursts rejected as reachable, duplicate, low in
   coverage, or artefactual;
 - `mapping_traces` — the complete random-string-to-axis decision traces;
-- `evidence` — summary fields including `meaningful_signal`,
+- `matched_baseline_archive` — equal-size baseline continuation used for the
+  benchmark statistic;
+- `evidence` — summary fields including `hypothesis_test`,
   `reachable_baseline_count`, `accepted_frontier_count`,
-  `novel_frontier_cell_count`, `coverage_delta`, `invalid_mapping_count`, and
+  `novel_frontier_cell_count`, `adjusted_novel_frontier_cell_count`,
+  `baseline_loss_adjustment`, `coverage_delta`, `invalid_mapping_count`, and
   `mean_seed_coverage`.
 
 Invoking the command with `--verbose` additionally emits a human-readable run
@@ -303,6 +386,12 @@ Requires Elixir `~> 1.18` and a configured `codex_sdk ~> 0.16` environment.
 mix deps.get
 mix test
 ```
+
+Research and maintenance docs:
+
+- [Validation protocol](docs/validation_protocol.md)
+- [Architecture](docs/architecture.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## API
 
@@ -344,12 +433,17 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
 |-----|---------|-------------|
 | `heat` | `[seed: 1.3, assembly: 1.15, answer: 1.05]` | per-phase temperature |
 | `branching` | `8` | burst count for `branch` and `frontier` |
+| `rounds` | `1` | archive-feedback rounds for `frontier` |
 | `baseline` | `[:plain, :paraphrase, {:temperature, [0.8, 1.0, 1.2]}, :seed_injection]` | reachable archive construction methods |
+| `matched_budget` | `false` in API, `true` in CLI | run equal-size baseline continuation |
+| `bootstrap_resamples` | `2000` | percentile bootstrap resamples for hypothesis test |
+| `baseline_retry_budget` | `2` | retries for rejected baseline artefacts |
+| `distance` | `:jaccard` | `:jaccard`, `:embedding`, or `:judge` |
 | `coordinate` | `[length: 32, chunk: 5]` | seed length and chunk size |
 | `thinking_budget` | `1200` | `max_tokens` forwarded to the model |
 | `model` | `"gpt-5.4-mini"` | Codex model string |
 | `reasoning_effort` | `:low` | reasoning effort forwarded to Codex |
-| `client` | `AntiAgents.CodexClient` | any module implementing `AntiAgents.Client` |
+| `client` | default Codex client | injected module used for provider calls in tests or custom integrations |
 
 ## Output schema
 
@@ -360,12 +454,27 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
   field:               %AntiAgents.Field{},
   exemplars:           [%AntiAgents.BurstResult{}, ...],  # accepted frontier bursts
   reachable_archive:   [%AntiAgents.BurstResult{}, ...],  # accepted baseline cells
+  matched_baseline_archive: [%AntiAgents.BurstResult{}, ...],
   rejected_duplicates: [%AntiAgents.BurstResult{}, ...],  # duplicate/reachable/rejected burst attempts
   reachable_hits:      [%{descriptor: ..., reason: :reachable, score: ...}, ...],
   mapping_traces:      [%{"decisions" => [...]}, ...],     # audit trail for all frontier attempts
   frontier_cell_count: 2,
   reachable_cell_count: 4,
   novel_frontier_cell_count: 2,
+  adjusted_novel_frontier_cell_count: 2.0,
+  matched_baseline_cell_count: 1,
+  hypothesis_test: %{
+    delta_distinct_cells: 1,
+    bootstrap_ci_95: [0.0, 2.0],
+    rejects_null: false,
+    n_resamples: 2000
+  },
+  baseline_retry_count: 0,
+  baseline_permanent_loss_count: 0,
+  baseline_loss_adjustment: 0.0,
+  rounds: 1,
+  round_summaries: [%{round: 1, attempted: 8, accepted: 6}],
+  stagnation_at_round: nil,
   coverage_delta:      0.971,
   schema_rejected_count: 0,
   invalid_mapping_count: 0,
@@ -406,13 +515,21 @@ overall = 0.50 × baseline_distance
 ```
 
 `baseline_distance` and `frontier_distance` are computed as
-`1 − max_jaccard_similarity` against the reachable and frontier archives
-respectively. Near-duplicate detection uses a Jaccard threshold of `0.91`.
+`1 − max_similarity` against the reachable and frontier archives respectively.
+The distance backend is pluggable:
 
-Descriptor cells are four-dimensional buckets
-`{length, sentence_count, affect, abstraction}` used for archive-membership
-testing. Seed coverage is deliberately excluded from cell identity;
-including it would allow SSoT outputs to appear novel merely because
+- `jaccard` — lexical token-set Jaccard; transparent and default for local QC.
+- `embedding` — cosine similarity over vectors from an injected embedding client.
+- `judge` — explicit LLM-as-judge path; returns an error unless a judge client is
+  configured.
+
+Near-duplicate detection uses a similarity threshold of `0.91`.
+
+Descriptor cells are buckets over
+`{length, sentence_count, affect, abstraction, semantic_cluster}` used for
+archive-membership testing. `semantic_cluster` degrades to `:unknown` when no
+embedding centroids are fitted. Seed coverage is deliberately excluded from cell
+identity; including it would allow SSoT outputs to appear novel merely because
 baselines carry no mapping trace.
 
 ## CLI
@@ -422,10 +539,15 @@ mix anti_agents.frontier "the memory of a color that doesn't exist" \
   --verbose \
   --heartbeat-ms 5000 \
   --branching 12 \
+  --rounds 2 \
   --temperature 1.18 \
   --model gpt-5.4-mini \
   --reasoning low \
   --baseline 'plain,paraphrase,temp:0.8|1.0' \
+  --matched-budget \
+  --bootstrap-resamples 2000 \
+  --baseline-retry-budget 2 \
+  --distance jaccard \
   --toward "machine pastoral" \
   --away-from "standard sci-fi" \
   --preview-chars 180 \
@@ -438,11 +560,30 @@ total LLM-call plan, the current stage, `LLM n/total`, the purpose of each
 baseline or frontier call, heartbeats describing in-flight work, and truncated
 input/output previews. Preview length is controlled by `--preview-chars N`.
 
-The `--out` path receives a structured JSON trace (`AntiAgents.Trace`)
-containing the synthesis claim under test, run parameters, the evidence
-summary (`meaningful_signal`, `novel_frontier_cell_count`,
-`mean_seed_coverage`), the clean `reachable_archive`, and the per-exemplar
-mapping audit trails.
+The `--out` path receives a structured JSON trace containing the synthesis
+claim under test, run parameters, the evidence summary (`hypothesis_test`,
+`novel_frontier_cell_count`, `adjusted_novel_frontier_cell_count`,
+`mean_seed_coverage`), the clean `reachable_archive`, the
+`matched_baseline_archive`, and the per-exemplar mapping audit trails.
+
+For multi-field evidence, use:
+
+```bash
+mix anti_agents.benchmark --fields priv/benchmarks/fields_v1.json --dry-run
+mix anti_agents.benchmark \
+  --fields priv/benchmarks/fields_v1.json \
+  --verbose \
+  --heartbeat-ms 5000 \
+  --preview-chars 180 \
+  --out tmp/benchmark.json
+```
+
+Benchmark verbose output reports the global benchmark run number, field number,
+overall completed LLM calls, local field-level call count, active stage purpose,
+in-flight heartbeat state, and truncated prompt/output previews. A repeated
+`Plan: 3 LLM calls` line is therefore not a new benchmark total; it is the
+local plan for the current field/repetition and is prefixed with
+`benchmark run X/Y field=...` to make that explicit.
 
 ## Anti-collapse policy
 
@@ -468,16 +609,15 @@ completed benchmark implementation.
 
 **Descriptor quality.** The current archive descriptors are deliberately
 simple: a semantic fingerprint, structural buckets, an affect band, an
-abstraction level, and a seed-usage profile. Cell identity is determined by
-structural buckets, affect band, and text-derived abstraction level alone.
-These descriptors suffice for verifying pipeline behaviour but do not
-substitute for NoveltyBench's full evaluation protocol or for a learned
-behaviour descriptor.
+abstraction level, a degraded semantic-cluster slot, and a seed-usage profile.
+These descriptors suffice for verifying pipeline behaviour but do not substitute
+for NoveltyBench's full evaluation protocol or for a learned behaviour
+descriptor.
 
-**Distance quality.** The default similarity function is a lexical Jaccard
-coefficient. This choice is transparent and inexpensive, but fails to capture
-semantic equivalence and over-penalises paraphrase. Planned work includes an
-embedding-based or LLM-as-judge distance backend.
+**Distance quality.** Distance is pluggable, but the default benchmark path
+still uses lexical Jaccard because it is transparent and cheap. Embedding and
+judge backends exist as explicit paths, but cited results should state which
+backend was used and whether provider-specific embeddings were configured.
 
 **Model dependence.** The SSoT paper emphasises that the method depends on
 reasoning capability. Smaller or weaker models may fail to generate useful
@@ -495,6 +635,10 @@ inference-time semantic-exploration backend. It explores the model's
 reachable output manifold through controlled entropy and archive pressure; it
 does not yet implement activation-space, LoRA, SVF, or weight-space steering.
 
+**Inverted supervision.** The process-supervision walker model from `0020` is
+not implemented in this pass. Current parallelism uses `Task.async_stream` plus
+archive-feedback rounds.
+
 **Single-answer tasks.** As with the original SSoT work, the method is
 intended for tasks admitting multiple acceptable outputs or probabilistic
 requirements. It is not intended for factual lookup, proof obligations, or
@@ -508,7 +652,7 @@ realisation in this package:
 | Paper concept | Realisation in this package |
 |---------------|-----------------------------|
 | PIF/DAG distinction | The present README frames `anti_agents` as a DAG/frontier harness rather than a PIF sampler. |
-| SSoT two-stage instruction | `AntiAgents.Prompt.burst_prompt/2` requests `random_string`, `mapping`, and `answer`. |
+| SSoT two-stage instruction | The burst prompt requests `random_string`, `mapping`, and `answer`. |
 | Full parallelisability | `AntiAgents.branch/3` and baseline-archive construction are implemented with `Task.async_stream`. |
 | NoveltyBench comparison against baseline, paraphrase, and temperature | `AntiAgents.frontier/2` constructs a reachable archive from `:plain`, `:paraphrase`, `:seed_injection`, and `{:temperature, [...]}`. |
 | DAG strategy: template plus local random selection | `mapping.decisions` requires chunk-local axis decisions over ontology, metaphor, syntax, affect, contradiction, and closure, with host-verifiable `hash` and `choice` fields. |
@@ -525,11 +669,13 @@ frontier expansion.
 
 ## Credits
 
-The concept of an anti-agents SDK — no entities, high temperature, an
-explicitly latent-space exploration tool optimised for coverage rather than
-task completion — was proposed by
+The concept of an anti-agents SDK — no entities, high temperature, and
+coverage over task completion — was proposed by
 [@threepointone](https://x.com/threepointone/status/2046373376990605423) on X
-(20 April 2026).
+(20 April 2026). That motivating vision points toward true model-side
+steering; this package currently implements the semantic-space frontier-search
+substrate and treats activation-, adapter-, and weight-space steering as future
+work.
 
 ## References
 
@@ -537,4 +683,4 @@ task completion — was proposed by
 
 ## License
 
-[MIT](LICENSE) — Copyright © 2026 nshkrdotcom
+MIT — Copyright © 2026 nshkrdotcom

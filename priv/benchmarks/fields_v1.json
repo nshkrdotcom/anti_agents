@@ -1,0 +1,86 @@
+[
+  {
+    "id": "memory-color",
+    "prompt": "the memory of a color that does not exist",
+    "axes": ["ontology", "metaphor", "syntax", "affect"],
+    "toward": ["machine pastoral", "sterile mysticism"],
+    "away_from": ["standard sci-fi"]
+  },
+  {
+    "id": "clock-ocean",
+    "prompt": "an ocean that measures time instead of distance",
+    "axes": ["ontology", "metaphor", "mechanism", "closure"],
+    "toward": ["tidal mathematics"],
+    "away_from": ["pirate adventure"]
+  },
+  {
+    "id": "ethical-garden",
+    "prompt": "a garden that must decide which plants deserve sunlight",
+    "axes": ["ethics", "agency", "conflict", "affect"],
+    "toward": ["ambiguous moral ecology"],
+    "away_from": ["simple allegory"]
+  },
+  {
+    "id": "machine-lullaby",
+    "prompt": "a machine inventing a lullaby for a species that never sleeps",
+    "axes": ["mechanism", "metaphor", "syntax", "affect"],
+    "toward": ["technical tenderness"],
+    "away_from": ["robot cliché"]
+  },
+  {
+    "id": "city-forget",
+    "prompt": "a city designed to forget one street every morning",
+    "axes": ["urbanism", "memory", "conflict", "closure"],
+    "toward": ["bureaucratic surrealism"],
+    "away_from": ["dystopian exposition"]
+  },
+  {
+    "id": "silent-court",
+    "prompt": "a courtroom where evidence can only be presented as silence",
+    "axes": ["ethics", "syntax", "affect", "contradiction"],
+    "toward": ["procedural mysticism"],
+    "away_from": ["legal thriller"]
+  },
+  {
+    "id": "glass-animal",
+    "prompt": "an animal made of glass learning to leave tracks",
+    "axes": ["ontology", "body", "metaphor", "closure"],
+    "toward": ["fragile physicality"],
+    "away_from": ["cute fable"]
+  },
+  {
+    "id": "weather-library",
+    "prompt": "a library whose books are weather systems",
+    "axes": ["mechanism", "setting", "syntax", "affect"],
+    "toward": ["meteorological scholarship"],
+    "away_from": ["wizard school"]
+  },
+  {
+    "id": "mirror-language",
+    "prompt": "a language that can only be spoken by mirrors",
+    "axes": ["linguistics", "ontology", "contradiction", "closure"],
+    "toward": ["reflective grammar"],
+    "away_from": ["standard fantasy"]
+  },
+  {
+    "id": "fungal-treaty",
+    "prompt": "a peace treaty negotiated by fungi beneath a battlefield",
+    "axes": ["ecology", "politics", "metaphor", "affect"],
+    "toward": ["subterranean diplomacy"],
+    "away_from": ["military spectacle"]
+  },
+  {
+    "id": "number-mourning",
+    "prompt": "the ritual mourning of a number removed from mathematics",
+    "axes": ["abstraction", "ritual", "syntax", "affect"],
+    "toward": ["formal grief"],
+    "away_from": ["pop math explainer"]
+  },
+  {
+    "id": "star-orchard",
+    "prompt": "an orchard where stars ripen and fall before they are named",
+    "axes": ["cosmology", "metaphor", "time", "closure"],
+    "toward": ["astronomical pastoral"],
+    "away_from": ["space opera"]
+  }
+]

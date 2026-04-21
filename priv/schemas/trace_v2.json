@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nshkrdotcom/anti_agents/schemas/trace_v2.json",
+  "title": "AntiAgents Frontier Trace",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "synthesis",
+    "field",
+    "run",
+    "metrics",
+    "evidence",
+    "reachable_archive",
+    "matched_baseline_archive",
+    "exemplars",
+    "mapping_traces"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer" },
+    "mode": { "const": "frontier_report" },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "hypothesis_test",
+        "novel_frontier_cell_count",
+        "adjusted_novel_frontier_cell_count",
+        "baseline_retry_count",
+        "baseline_permanent_loss_count",
+        "baseline_loss_adjustment"
+      ]
+    }
+  }
+}

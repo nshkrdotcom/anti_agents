@@ -8,6 +8,8 @@ defmodule AntiAgents.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      aliases: aliases(),
+      preferred_cli_env: preferred_cli_env(),
       docs: docs(),
       package: package(),
       dialyzer: dialyzer()
@@ -38,7 +40,7 @@ defmodule AntiAgents.MixProject do
       source_url: "https://github.com/nshkrdotcom/anti_agents",
       homepage_url: "https://github.com/nshkrdotcom/anti_agents",
       logo: "assets/anti_agents.svg",
-      extras: ["README.md", "CHANGELOG.md"],
+      extras: ["README.md", "CHANGELOG.md", "CONTRIBUTING.md"] ++ Path.wildcard("docs/*.md"),
       assets: %{"assets" => "assets"}
     ]
   end
@@ -50,9 +52,12 @@ defmodule AntiAgents.MixProject do
         "SSoT frontier prompting, burst branching, and novelty scoring for Codex-backed diversity experiments.",
       files: [
         "lib",
+        "priv",
         "assets",
+        "docs",
         "README.md",
         "CHANGELOG.md",
+        "CONTRIBUTING.md",
         "LICENSE",
         "mix.exs"
       ],
@@ -67,6 +72,24 @@ defmodule AntiAgents.MixProject do
   defp dialyzer do
     [
       plt_add_apps: [:ex_unit, :mix]
+    ]
+  end
+
+  defp aliases do
+    [
+      verify: [
+        "format --check-formatted",
+        "compile --warnings-as-errors",
+        "test",
+        "dialyzer",
+        "anti_agents.benchmark --fields priv/benchmarks/fields_v1.json --dry-run"
+      ]
+    ]
+  end
+
+  defp preferred_cli_env do
+    [
+      verify: :test
     ]
   end
 end

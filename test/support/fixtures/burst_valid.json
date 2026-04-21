@@ -1,0 +1,11 @@
+{
+  "random_string": "abcdef123456",
+  "mapping": {
+    "decisions": [
+      { "axis": "ontology", "chunk": 0, "hash": 500, "choice": 3, "value": "treat the field as an object" },
+      { "axis": "metaphor", "chunk": 1, "hash": 409, "choice": 3, "value": "select a glass metaphor" },
+      { "axis": "closure", "chunk": 2, "hash": 318, "choice": 3, "value": "close with unresolved residue" }
+    ]
+  },
+  "answer": "A valid burst fixture."
+}

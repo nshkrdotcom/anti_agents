@@ -1,0 +1,10 @@
+{
+  "random_string": "abcdef123456",
+  "mapping": {
+    "decisions": [
+      { "axis": "ontology", "chunk": 0, "hash": 500, "choice": 3, "value": "first chunk only" },
+      { "axis": "metaphor", "chunk": 0, "hash": 500, "choice": 3, "value": "still first chunk" }
+    ]
+  },
+  "answer": "A prefix-only burst fixture."
+}

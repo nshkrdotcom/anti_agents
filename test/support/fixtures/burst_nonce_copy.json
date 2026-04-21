@@ -1,0 +1,10 @@
+{
+  "random_string": "host-nonce",
+  "mapping": {
+    "decisions": [
+      { "axis": "ontology", "chunk": 0, "hash": 597, "choice": 2, "value": "copied nonce" },
+      { "axis": "metaphor", "chunk": 1, "hash": 638, "choice": 1, "value": "copied nonce continuation" }
+    ]
+  },
+  "answer": "A nonce-copy burst fixture."
+}

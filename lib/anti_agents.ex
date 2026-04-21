@@ -170,7 +170,17 @@ defmodule AntiAgents.FrontierReport do
     frontier_cell_count: 0,
     reachable_cell_count: 0,
     novel_frontier_cell_count: 0,
+    adjusted_novel_frontier_cell_count: 0.0,
     coverage_delta: 0.0,
+    baseline_retry_count: 0,
+    baseline_permanent_loss_count: 0,
+    baseline_loss_adjustment: 0.0,
+    matched_baseline_archive: [],
+    matched_baseline_cell_count: 0,
+    hypothesis_test: %{},
+    rounds: 1,
+    round_summaries: [],
+    stagnation_at_round: nil,
     schema_rejected_count: 0,
     invalid_mapping_count: 0,
     duplicate_random_string_count: 0,
@@ -187,7 +197,17 @@ defmodule AntiAgents.FrontierReport do
           frontier_cell_count: non_neg_integer(),
           reachable_cell_count: non_neg_integer(),
           novel_frontier_cell_count: non_neg_integer(),
+          adjusted_novel_frontier_cell_count: float(),
           coverage_delta: float(),
+          baseline_retry_count: non_neg_integer(),
+          baseline_permanent_loss_count: non_neg_integer(),
+          baseline_loss_adjustment: float(),
+          matched_baseline_archive: [AntiAgents.BurstResult.t()],
+          matched_baseline_cell_count: non_neg_integer(),
+          hypothesis_test: map(),
+          rounds: pos_integer(),
+          round_summaries: [map()],
+          stagnation_at_round: pos_integer() | nil,
           schema_rejected_count: non_neg_integer(),
           invalid_mapping_count: non_neg_integer(),
           duplicate_random_string_count: non_neg_integer(),
@@ -447,7 +467,24 @@ defmodule AntiAgents.Prompt do
     Steering:
     toward=#{toward}
     away_from=#{away_from}
+    #{archive_feedback(opts)}
     """
+  end
+
+  defp archive_feedback(opts) do
+    case get_option(opts, :steering_delta) do
+      nil ->
+        ""
+
+      %{text: text} when is_binary(text) ->
+        "Archive feedback: #{text}"
+
+      text when is_binary(text) ->
+        "Archive feedback: #{text}"
+
+      _other ->
+        ""
+    end
   end
 
   def field_input(field, opts) do
@@ -712,6 +749,14 @@ defmodule AntiAgents.Scoring do
     |> Float.round(3)
   end
 
+  def fit_centroids(vectors, k) when is_list(vectors) and is_integer(k) and k > 0 do
+    vectors
+    |> Enum.uniq()
+    |> Enum.take(k)
+  end
+
+  def fit_centroids(_vectors, _k), do: []
+
   def local_hash(_axis, chunk_text, chunk_index) do
     "#{chunk_index}:#{chunk_text}"
     |> :binary.bin_to_list()
@@ -783,17 +828,27 @@ defmodule AntiAgents.Scoring do
     prefix_only? or poor_coverage?
   end
 
-  def score(candidate, reachable, frontier) do
-    baseline_distance = 1.0 - maximum_similarity(candidate.answer, reachable)
-    frontier_distance = 1.0 - maximum_similarity(candidate.answer, frontier)
+  def score_weights do
+    %{
+      baseline_distance: 0.50,
+      frontier_distance: 0.25,
+      seed_coverage: 0.15,
+      coherence: 0.10
+    }
+  end
+
+  def score(candidate, reachable, frontier, opts \\ []) do
+    baseline_distance = 1.0 - maximum_similarity(candidate.answer, reachable, opts)
+    frontier_distance = 1.0 - maximum_similarity(candidate.answer, frontier, opts)
     coverage = candidate.seed_coverage
     coherence = candidate.coherence
+    weights = score_weights()
 
     overall =
-      0.50 * baseline_distance +
-        0.25 * frontier_distance +
-        0.15 * coverage +
-        0.10 * coherence
+      weights.baseline_distance * baseline_distance +
+        weights.frontier_distance * frontier_distance +
+        weights.seed_coverage * coverage +
+        weights.coherence * coherence
 
     %{
       baseline_distance: baseline_distance,
@@ -804,20 +859,27 @@ defmodule AntiAgents.Scoring do
     }
   end
 
-  def similarity(a, b), do: jaccard_similarity(a, b)
+  def similarity(a, b, opts \\ []) do
+    backend = opts |> Keyword.get(:distance, :jaccard) |> AntiAgents.Distance.resolve()
+
+    case backend.pairwise(a, b, opts) do
+      {:ok, value} -> value
+      {:error, _reason} -> AntiAgents.Distance.Jaccard.similarity(a, b)
+    end
+  end
 
   def maximum_similarity(_text, []), do: 0.0
 
-  def maximum_similarity(text, bursts) when is_list(bursts) do
+  def maximum_similarity(text, bursts, opts \\ []) when is_list(bursts) do
     Enum.map(bursts, fn
-      %AntiAgents.BurstResult{answer: answer} -> jaccard_similarity(answer, text)
-      %{answer: answer} -> jaccard_similarity(answer, text)
+      %AntiAgents.BurstResult{answer: answer} -> similarity(answer, text, opts)
+      %{answer: answer} -> similarity(answer, text, opts)
     end)
     |> Enum.max(fn -> 0.0 end)
   end
 
-  def near_duplicate?(text, bursts, threshold \\ 0.91) do
-    maximum_similarity(text, bursts) > threshold
+  def near_duplicate?(text, bursts, threshold \\ 0.91, opts \\ []) do
+    maximum_similarity(text, bursts, opts) > threshold
   end
 
   def artifact_answer?(answer) when is_binary(answer) do
@@ -1064,26 +1126,13 @@ defmodule AntiAgents.Scoring do
     |> binary_part(0, 12)
   end
 
-  defp jaccard_similarity(a, b) when is_binary(a) and is_binary(b) do
-    a_tokens = token_set(a) |> MapSet.new()
-    b_tokens = token_set(b) |> MapSet.new()
-
-    union = MapSet.union(a_tokens, b_tokens) |> MapSet.size()
-    intersection = MapSet.intersection(a_tokens, b_tokens) |> MapSet.size()
-
-    if union == 0 do
-      0.0
-    else
-      intersection / union
-    end
-  end
-
   defp novelty_cell(structural, affect, abstraction, _seed_profile) do
     %{
       length: length_bucket(structural.length),
       sentence_count: sentence_bucket(structural.sentence_count),
       affect: affect,
-      abstraction: abstraction
+      abstraction: abstraction,
+      semantic_cluster: :unknown
     }
   end
 
@@ -1665,18 +1714,22 @@ defmodule AntiAgents.Frontier do
   @moduledoc false
 
   alias AntiAgents.{BurstResult, Bursts, Field, FrontierReport, Progress, Prompt, Scoring}
+  alias AntiAgents.Statistics
 
   @type compare_output :: %{
           field: Field.t(),
           reachable_archive: [BurstResult.t()],
           frontier_archive: [BurstResult.t()],
           novel_frontier_cell_count: non_neg_integer(),
+          baseline_stats: map(),
           reachable_hits: [map()],
           duplicates: [BurstResult.t()]
         }
 
   def compare(%Field{} = field, opts \\ []) do
     branch_count = Keyword.get(opts, :branching, 8)
+    rounds = opts |> Keyword.get(:rounds, 1) |> max(1)
+    matched_budget? = Keyword.get(opts, :matched_budget, false)
 
     baseline_opts =
       Keyword.get(opts, :baseline, [
@@ -1687,11 +1740,14 @@ defmodule AntiAgents.Frontier do
       ])
 
     baseline_count = baseline_method_count(baseline_opts)
-    total_llm_calls = baseline_count + branch_count
+    planned_frontier_calls = branch_count * rounds
+    planned_matched_calls = if matched_budget?, do: planned_frontier_calls, else: 0
+    total_llm_calls = baseline_count + planned_frontier_calls + planned_matched_calls
 
     Progress.event(opts, :run_plan, %{
       baseline_calls: baseline_count,
-      frontier_bursts: branch_count,
+      frontier_bursts: planned_frontier_calls,
+      matched_baseline_calls: planned_matched_calls,
       total_llm_calls: total_llm_calls,
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
     })
@@ -1702,17 +1758,30 @@ defmodule AntiAgents.Frontier do
     })
 
     Progress.event(opts, :baseline_start, %{methods: baseline_count})
-    reachable = baseline_bursts(field, baseline_opts, opts, total_llm_calls)
+    {reachable, baseline_stats} = baseline_bursts(field, baseline_opts, opts, total_llm_calls)
 
-    Progress.event(opts, :baseline_done, %{accepted: length(reachable)})
-    Progress.event(opts, :frontier_start, %{branching: branch_count})
+    Progress.event(opts, :baseline_done, Map.put(baseline_stats, :accepted, length(reachable)))
+    Progress.event(opts, :frontier_start, %{branching: planned_frontier_calls})
 
-    frontier_opts =
-      opts
-      |> Keyword.put(:progress_llm_offset, baseline_count)
-      |> Keyword.put(:progress_llm_total, total_llm_calls)
+    {frontier_bursts, round_summaries, stagnation_at_round} =
+      frontier_rounds(field, branch_count, rounds, opts, baseline_count, total_llm_calls)
 
-    frontier_bursts = Bursts.branch(field, branch_count, frontier_opts)
+    accepted_frontier_count = Enum.count(frontier_bursts, &(&1.status == :accepted))
+
+    {matched_baseline, matched_stats} =
+      if matched_budget? and accepted_frontier_count > 0 do
+        matched_baseline(
+          field,
+          baseline_opts,
+          Keyword.merge(opts,
+            matched_baseline_count: accepted_frontier_count,
+            progress_llm_offset: baseline_count + planned_frontier_calls,
+            progress_llm_total: total_llm_calls
+          )
+        )
+      else
+        {[], baseline_attempt_stats(0, 0)}
+      end
 
     Progress.event(opts, :frontier_done, %{
       total: length(frontier_bursts),
@@ -1724,11 +1793,94 @@ defmodule AntiAgents.Frontier do
       field: field,
       reachable_archive: reachable,
       frontier_archive: frontier_bursts,
+      matched_baseline_archive: matched_baseline,
+      round_summaries: round_summaries,
+      stagnation_at_round: stagnation_at_round,
+      rounds: rounds,
       novel_frontier_cell_count: novel_cell_count(frontier_bursts, reachable),
+      baseline_stats: merge_baseline_stats([baseline_stats, matched_stats]),
       reachable_hits: reachable_intersections(frontier_bursts, reachable),
       duplicates: duplicates(frontier_bursts)
     }
   end
+
+  def matched_baseline(%Field{} = field, baseline_methods, opts \\ []) do
+    count = Keyword.get(opts, :matched_baseline_count, Keyword.get(opts, :branching, 8))
+
+    methods =
+      baseline_methods
+      |> Enum.flat_map(&expand_method/1)
+      |> cycle_methods(count)
+
+    baseline_bursts(field, methods, opts, Keyword.get(opts, :progress_llm_total, count))
+  end
+
+  defp frontier_rounds(field, branch_count, rounds, opts, baseline_count, total_llm_calls) do
+    1..rounds
+    |> Enum.reduce_while({[], [], nil}, fn round, {bursts_acc, summaries_acc, _stagnation} ->
+      accepted_so_far = Enum.filter(bursts_acc, &(&1.status == :accepted))
+
+      round_opts =
+        opts
+        |> Keyword.put(:progress_llm_offset, baseline_count + (round - 1) * branch_count)
+        |> Keyword.put(:progress_llm_total, total_llm_calls)
+        |> Keyword.put(:round, round)
+        |> maybe_put_steering_delta(archive_steering_delta(accepted_so_far, round))
+
+      bursts = Bursts.branch(field, branch_count, round_opts)
+      accepted_count = Enum.count(bursts, &(&1.status == :accepted))
+
+      summary = %{
+        round: round,
+        attempted: length(bursts),
+        accepted: accepted_count,
+        rejected: Enum.count(bursts, &(&1.status == :rejected)),
+        errors: Enum.count(bursts, &(&1.status in [:provider_error, :parse_error]))
+      }
+
+      updated_bursts = bursts_acc ++ bursts
+      updated_summaries = summaries_acc ++ [summary]
+
+      if accepted_count == 0 do
+        {:halt, {updated_bursts, updated_summaries, round}}
+      else
+        {:cont, {updated_bursts, updated_summaries, nil}}
+      end
+    end)
+  end
+
+  defp maybe_put_steering_delta(opts, nil), do: opts
+  defp maybe_put_steering_delta(opts, delta), do: Keyword.put(opts, :steering_delta, delta)
+
+  defp archive_steering_delta(_accepted_so_far, 1), do: nil
+  defp archive_steering_delta([], _round), do: nil
+
+  defp archive_steering_delta(accepted_so_far, _round) do
+    overfilled =
+      accepted_so_far
+      |> Enum.map(& &1.descriptor.cell)
+      |> Enum.frequencies()
+      |> Enum.max_by(fn {_cell, count} -> count end, fn -> {nil, 0} end)
+      |> elem(0)
+
+    if is_nil(overfilled) do
+      nil
+    else
+      %{
+        text:
+          "Prefer a descriptor region unlike #{cell_label(overfilled)}; avoid repeating the most populated archive cell."
+          |> String.slice(0, 200)
+      }
+    end
+  end
+
+  defp cell_label(cell) when is_map(cell) do
+    cell
+    |> Enum.map(fn {key, value} -> "#{key}=#{value}" end)
+    |> Enum.join("/")
+  end
+
+  defp cell_label(cell), do: inspect(cell)
 
   def frontier(%Field{} = field, opts \\ []) do
     report = compare(field, opts)
@@ -1736,7 +1888,7 @@ defmodule AntiAgents.Frontier do
     {accepted, rejected_duplicates} =
       partition_frontier(report.frontier_archive, report.reachable_archive)
 
-    accepted = Enum.reverse(accepted) |> score_frontier(report.reachable_archive)
+    accepted = Enum.reverse(accepted) |> score_frontier(report.reachable_archive, opts)
     rejected_duplicates = Enum.reverse(rejected_duplicates)
 
     frontier_cells =
@@ -1750,7 +1902,22 @@ defmodule AntiAgents.Frontier do
     archive_size = length(report.frontier_archive)
     frontier_cell_count = length(frontier_cells)
     novel_frontier_cell_count = frontier_cell_count
+
+    baseline_loss_adjustment =
+      baseline_loss_adjustment(
+        report.baseline_stats.permanent_loss_count,
+        report.reachable_archive,
+        novel_frontier_cell_count
+      )
+
+    adjusted_novel_frontier_cell_count =
+      max(0.0, Float.round(novel_frontier_cell_count - baseline_loss_adjustment, 3))
+
     coverage_delta = avg(accepted, :seed_coverage) - avg(report.reachable_archive, :seed_coverage)
+    hypothesis_test = hypothesis_test(accepted, report.matched_baseline_archive, opts)
+
+    hypothesis_test =
+      maybe_force_null_for_baseline_loss(hypothesis_test, adjusted_novel_frontier_cell_count)
 
     frontier_report = %FrontierReport{
       field: field,
@@ -1759,7 +1926,18 @@ defmodule AntiAgents.Frontier do
       frontier_cell_count: frontier_cell_count,
       reachable_cell_count: reachable_cell_count,
       novel_frontier_cell_count: novel_frontier_cell_count,
+      adjusted_novel_frontier_cell_count: adjusted_novel_frontier_cell_count,
       coverage_delta: Float.round(coverage_delta, 3),
+      baseline_retry_count: report.baseline_stats.retry_count,
+      baseline_permanent_loss_count: report.baseline_stats.permanent_loss_count,
+      baseline_loss_adjustment: baseline_loss_adjustment,
+      matched_baseline_archive: report.matched_baseline_archive,
+      matched_baseline_cell_count:
+        Statistics.distinct_cell_count(report.matched_baseline_archive),
+      hypothesis_test: hypothesis_test,
+      rounds: report.rounds,
+      round_summaries: report.round_summaries,
+      stagnation_at_round: report.stagnation_at_round,
       schema_rejected_count: count_status(report.frontier_archive, :parse_error),
       invalid_mapping_count: count_rejection(report.frontier_archive, "invalid mapping"),
       duplicate_random_string_count:
@@ -1791,41 +1969,96 @@ defmodule AntiAgents.Frontier do
     concurrency = baseline_concurrency(opts, length(expanded))
     timeout = Keyword.get(opts, :timeout_ms, 120_000)
 
-    expanded
-    |> Enum.with_index(1)
-    |> Task.async_stream(
-      fn {method, index} ->
-        baseline_burst(field, method, opts, index, length(expanded), total_llm_calls)
-      end,
-      max_concurrency: concurrency,
-      timeout: timeout,
-      ordered: true
-    )
-    |> Enum.map(fn
-      {:ok, burst} -> burst
-      {:exit, _reason} -> nil
-    end)
-    |> Enum.reject(&is_nil/1)
+    results =
+      expanded
+      |> Enum.with_index(1)
+      |> Task.async_stream(
+        fn {method, index} ->
+          baseline_burst(field, method, opts, index, length(expanded), total_llm_calls)
+        end,
+        max_concurrency: concurrency,
+        timeout: timeout,
+        ordered: true
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, _reason} -> {nil, baseline_attempt_stats(0, 1)}
+      end)
+
+    accepted =
+      results
+      |> Enum.map(fn {burst, _stats} -> burst end)
+      |> Enum.reject(&is_nil/1)
+
+    stats =
+      results
+      |> Enum.map(fn {_burst, stats} -> stats end)
+      |> merge_baseline_stats()
+
+    {accepted, stats}
   end
 
   defp expand_method(:plain), do: [:plain]
   defp expand_method(:paraphrase), do: [:paraphrase]
   defp expand_method(:seed_injection), do: [:seed_injection]
+  defp expand_method({:temperature, temp}) when is_number(temp), do: [{:temperature, temp}]
 
   defp expand_method({:temperature, temps}) when is_list(temps),
     do: Enum.map(temps, &{:temperature, &1})
 
   defp expand_method(_), do: []
 
+  defp cycle_methods(_methods, count) when count <= 0, do: []
+  defp cycle_methods([], _count), do: []
+
+  defp cycle_methods(methods, count) do
+    methods
+    |> Stream.cycle()
+    |> Enum.take(count)
+  end
+
   defp baseline_burst(field, method, opts, index, total, total_llm_calls) do
     client = Keyword.get(opts, :client, AntiAgents.CodexClient)
     method_opts = baseline_method_opts(method, opts)
-    prompt = Prompt.baseline_prompt(field, method, method_opts)
     input = Prompt.baseline_input(field, method, method_opts)
+    retry_budget = Keyword.get(opts, :baseline_retry_budget, 2)
 
-    Progress.event(opts, :baseline_call_start, %{
+    baseline_burst_attempt(
+      field,
+      method,
+      client,
+      method_opts,
+      input,
+      index,
+      total,
+      total_llm_calls,
+      retry_budget,
+      0,
+      baseline_attempt_stats(0, 0)
+    )
+  end
+
+  defp baseline_burst_attempt(
+         field,
+         method,
+         client,
+         method_opts,
+         input,
+         index,
+         total,
+         total_llm_calls,
+         retry_budget,
+         attempt,
+         stats
+       ) do
+    prompt =
+      field
+      |> Prompt.baseline_prompt(method, method_opts)
+      |> maybe_strengthen_baseline_prompt(attempt)
+
+    Progress.event(method_opts, :baseline_call_start, %{
       index: index,
-      llm_index: index,
+      llm_index: baseline_llm_index(method_opts, index),
       llm_total: total_llm_calls,
       total: total,
       method: method_label(method),
@@ -1836,9 +2069,9 @@ defmodule AntiAgents.Frontier do
       {:ok, raw} ->
         case build_baseline_burst(field, method, raw) do
           {:ok, burst} ->
-            Progress.event(opts, :baseline_call_done, %{
+            Progress.event(method_opts, :baseline_call_done, %{
               index: index,
-              llm_index: index,
+              llm_index: baseline_llm_index(method_opts, index),
               llm_total: total_llm_calls,
               method: method_label(method),
               total: total,
@@ -1846,34 +2079,121 @@ defmodule AntiAgents.Frontier do
               output_preview: burst.answer
             })
 
-            burst
+            {burst, stats}
 
           {:error, reason, preview} ->
-            Progress.event(opts, :baseline_call_rejected, %{
-              index: index,
-              llm_index: index,
-              llm_total: total_llm_calls,
-              method: method_label(method),
-              total: total,
-              reason: inspect(reason),
-              output_preview: preview
-            })
-
-            nil
+            retry_or_reject_baseline(
+              field,
+              method,
+              client,
+              method_opts,
+              input,
+              index,
+              total,
+              total_llm_calls,
+              retry_budget,
+              attempt,
+              stats,
+              reason,
+              preview
+            )
         end
 
       {:error, reason} ->
-        Progress.event(opts, :baseline_call_error, %{
+        Progress.event(method_opts, :baseline_call_error, %{
           index: index,
-          llm_index: index,
+          llm_index: baseline_llm_index(method_opts, index),
           llm_total: total_llm_calls,
           method: method_label(method),
           total: total,
           reason: inspect(reason)
         })
 
-        nil
+        {nil, Map.update!(stats, :permanent_loss_count, &(&1 + 1))}
     end
+  end
+
+  defp baseline_llm_index(opts, index), do: Keyword.get(opts, :progress_llm_offset, 0) + index
+
+  defp retry_or_reject_baseline(
+         field,
+         method,
+         client,
+         method_opts,
+         input,
+         index,
+         total,
+         total_llm_calls,
+         retry_budget,
+         attempt,
+         stats,
+         reason,
+         preview
+       ) do
+    if attempt < retry_budget do
+      retry_count = attempt + 1
+
+      Progress.event(method_opts, :baseline_call_retry, %{
+        index: index,
+        llm_index: baseline_llm_index(method_opts, index),
+        llm_total: total_llm_calls,
+        method: method_label(method),
+        total: total,
+        attempt: retry_count,
+        retry_budget: retry_budget,
+        reason: inspect(reason),
+        output_preview: preview
+      })
+
+      baseline_burst_attempt(
+        field,
+        method,
+        client,
+        method_opts,
+        input,
+        index,
+        total,
+        total_llm_calls,
+        retry_budget,
+        retry_count,
+        Map.update!(stats, :retry_count, &(&1 + 1))
+      )
+    else
+      Progress.event(method_opts, :baseline_call_rejected, %{
+        index: index,
+        llm_index: baseline_llm_index(method_opts, index),
+        llm_total: total_llm_calls,
+        method: method_label(method),
+        total: total,
+        reason: inspect(reason),
+        output_preview: preview
+      })
+
+      {nil, Map.update!(stats, :permanent_loss_count, &(&1 + 1))}
+    end
+  end
+
+  defp maybe_strengthen_baseline_prompt(prompt, 0), do: prompt
+
+  defp maybe_strengthen_baseline_prompt(prompt, _attempt) do
+    prompt <>
+      "\n\nRetry correction: return only the generated answer text. Do not return JSON, code fences, prompt text, field labels, CLI commands, or instructions."
+  end
+
+  defp baseline_attempt_stats(retry_count, permanent_loss_count) do
+    %{
+      retry_count: retry_count,
+      permanent_loss_count: permanent_loss_count
+    }
+  end
+
+  defp merge_baseline_stats(stats) do
+    Enum.reduce(stats, baseline_attempt_stats(0, 0), fn stat, acc ->
+      %{
+        retry_count: acc.retry_count + Map.get(stat, :retry_count, 0),
+        permanent_loss_count: acc.permanent_loss_count + Map.get(stat, :permanent_loss_count, 0)
+      }
+    end)
   end
 
   defp baseline_method_count(methods) do
@@ -1927,10 +2247,10 @@ defmodule AntiAgents.Frontier do
     |> max(1)
   end
 
-  defp score_frontier(accepted, reachable) do
+  defp score_frontier(accepted, reachable, opts) do
     Enum.map(accepted, fn burst ->
       peers = Enum.reject(accepted, &(&1 == burst))
-      Map.put(burst, :score, Scoring.score(burst, reachable, peers))
+      Map.put(burst, :score, Scoring.score(burst, reachable, peers, opts))
     end)
   end
 
@@ -2045,6 +2365,52 @@ defmodule AntiAgents.Frontier do
     |> Enum.uniq()
     |> length()
   end
+
+  defp baseline_loss_adjustment(0, _reachable, _novel_count), do: 0.0
+  defp baseline_loss_adjustment(_loss_count, _reachable, 0), do: 0.0
+
+  defp baseline_loss_adjustment(loss_count, [], novel_count) do
+    min(loss_count, novel_count) * 1.0
+  end
+
+  defp baseline_loss_adjustment(loss_count, reachable, novel_count) do
+    expected_cells_per_lost_call = distinct_cell_count(reachable) / max(1, length(reachable))
+
+    loss_count
+    |> Kernel.*(expected_cells_per_lost_call)
+    |> min(novel_count)
+    |> Float.round(3)
+  end
+
+  defp hypothesis_test(frontier, matched_baseline, opts) do
+    if Keyword.get(opts, :matched_budget, false) do
+      Statistics.hypothesis_test(frontier, matched_baseline,
+        resamples: Keyword.get(opts, :bootstrap_resamples, 2_000),
+        seed: Keyword.get(opts, :bootstrap_seed, 1)
+      )
+      |> Map.put(:enabled, true)
+    else
+      %{
+        enabled: false,
+        delta_distinct_cells:
+          Statistics.distinct_cell_count(frontier) -
+            Statistics.distinct_cell_count(matched_baseline),
+        bootstrap_ci_95: [0.0, 0.0],
+        rejects_null: false,
+        matched_baseline_cell_count: Statistics.distinct_cell_count(matched_baseline),
+        frontier_cell_count: Statistics.distinct_cell_count(frontier),
+        n_resamples: 0
+      }
+    end
+  end
+
+  defp maybe_force_null_for_baseline_loss(hypothesis_test, adjusted_novel_frontier_cell_count)
+       when adjusted_novel_frontier_cell_count <= 0 do
+    %{hypothesis_test | rejects_null: false}
+  end
+
+  defp maybe_force_null_for_baseline_loss(hypothesis_test, _adjusted_novel_frontier_cell_count),
+    do: hypothesis_test
 
   defp count_status(bursts, status), do: Enum.count(bursts, &(&1.status == status))
 

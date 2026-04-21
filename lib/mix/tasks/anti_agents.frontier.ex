@@ -57,12 +57,16 @@ defmodule Mix.Tasks.AntiAgents.Frontier do
       |> Keyword.get(:baseline, [])
       |> baseline_call_count()
 
-    frontier_bursts = Keyword.get(opts, :branching, 8)
+    frontier_bursts = Keyword.get(opts, :branching, 8) * Keyword.get(opts, :rounds, 1)
+
+    matched_baseline_calls =
+      if Keyword.get(opts, :matched_budget, true), do: frontier_bursts, else: 0
 
     AntiAgents.Progress.event(opts, :run_plan, %{
       baseline_calls: baseline_calls,
       frontier_bursts: frontier_bursts,
-      total_llm_calls: baseline_calls + frontier_bursts,
+      matched_baseline_calls: matched_baseline_calls,
+      total_llm_calls: baseline_calls + frontier_bursts + matched_baseline_calls,
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
     })
   end

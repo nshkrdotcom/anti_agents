@@ -6,10 +6,14 @@ defmodule AntiAgents.CLI do
     include_raw: :boolean,
     verbose: :boolean,
     branching: :integer,
+    rounds: :integer,
     concurrency: :integer,
     heartbeat_ms: :integer,
     preview_chars: :integer,
     timeout_ms: :integer,
+    baseline_retry_budget: :integer,
+    matched_budget: :boolean,
+    bootstrap_resamples: :integer,
     temperature: :float,
     seed_temperature: :float,
     assembly_temperature: :float,
@@ -19,6 +23,7 @@ defmodule AntiAgents.CLI do
     model: :string,
     reasoning: :string,
     baseline: :string,
+    distance: :string,
     out: :string,
     toward: :keep,
     away_from: :keep
@@ -55,10 +60,17 @@ defmodule AntiAgents.CLI do
 
     Common options:
       --branching N           frontier burst count, default 8
+      --rounds N              adaptive archive-feedback rounds, default 1
       --temperature FLOAT     answer/model temperature request, default 1.05
       --model MODEL           default gpt-5.4-mini
       --reasoning EFFORT      default low
       --baseline LIST         plain,paraphrase,seed_injection,temp:0.8|1.0|1.2
+      --baseline-retry-budget N
+                              retry rejected baseline artifacts, default 2
+      --matched-budget / --no-matched-budget
+                              run equal-size baseline continuation, default true
+      --bootstrap-resamples N percentile bootstrap resamples, default 2000
+      --distance BACKEND      jaccard, embedding, or judge; default jaccard
       --out PATH              write JSON trace to PATH
       --verbose               emit step-by-step progress and heartbeat logs
       --heartbeat-ms N        verbose heartbeat interval, default 5000
@@ -80,10 +92,15 @@ defmodule AntiAgents.CLI do
         away_from: Keyword.get_values(opts, :away_from)
       ],
       branching: Keyword.get(opts, :branching, 8),
+      rounds: Keyword.get(opts, :rounds, 1),
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
       heartbeat_ms: Keyword.get(opts, :heartbeat_ms, 5_000),
       preview_chars: Keyword.get(opts, :preview_chars, 180),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
+      baseline_retry_budget: Keyword.get(opts, :baseline_retry_budget, 2),
+      matched_budget: Keyword.get(opts, :matched_budget, true),
+      bootstrap_resamples: Keyword.get(opts, :bootstrap_resamples, 2_000),
+      distance: opts |> Keyword.get(:distance, "jaccard") |> parse_distance(),
       model: Keyword.get(opts, :model, AntiAgents.CodexConfig.default_model()),
       reasoning_effort:
         opts
@@ -126,6 +143,10 @@ defmodule AntiAgents.CLI do
   end
 
   defp parse_baseline_entry(_unknown), do: []
+
+  defp parse_distance("embedding"), do: :embedding
+  defp parse_distance("judge"), do: :judge
+  defp parse_distance(_other), do: :jaccard
 
   defp parse_temperature_list(temps) do
     temps
