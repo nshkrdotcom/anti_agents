@@ -164,6 +164,7 @@ defmodule AntiAgents.FrontierReport do
   defstruct [
     :field,
     exemplars: [],
+    reachable_archive: [],
     delta_frontier: 0.0,
     reachable_hits: [],
     rejected_duplicates: [],
@@ -174,6 +175,7 @@ defmodule AntiAgents.FrontierReport do
   @type t :: %__MODULE__{
           field: AntiAgents.Field.t(),
           exemplars: [AntiAgents.BurstResult.t()],
+          reachable_archive: [AntiAgents.BurstResult.t()],
           delta_frontier: float(),
           reachable_hits: [map()],
           rejected_duplicates: [AntiAgents.BurstResult.t()],
@@ -447,7 +449,7 @@ defmodule AntiAgents.Prompt do
     seed = get_seed(opts)
 
     plain_rule =
-      "\n\nReturn plain text only. Do not return JSON, XML tags, random_string, mapping, or prompt text."
+      "\n\nReturn only the answer text. Do not explain, rewrite the prompt, mention AntiAgents, mention CLI/mix commands, use code fences, return JSON/XML, or include random_string/mapping."
 
     case method do
       :plain ->
@@ -932,7 +934,36 @@ defmodule AntiAgents.Scoring do
       String.contains?(text, "<mapping>") or
       String.contains?(text, "Coordinate nonce:") or
       String.contains?(text, "Field prompt:") or
+      sdk_or_prompt_artifact?(text) or
+      malformed_control_payload?(text) or
       control_json_payload?(text)
+  end
+
+  defp sdk_or_prompt_artifact?(text) do
+    normalized = String.downcase(text)
+
+    Enum.any?(
+      [
+        "antiagents.",
+        "anti_agents.",
+        "mix anti_agents",
+        "```",
+        "equivalent cli",
+        "if you want",
+        "refined version of the prompt",
+        "rewrite the prompt",
+        "format this as"
+      ],
+      &String.contains?(normalized, &1)
+    )
+  end
+
+  defp malformed_control_payload?(text) do
+    has_random = String.contains?(text, ["\"random_string\"", "random_string:"])
+    has_mapping = String.contains?(text, ["\"mapping\"", "mapping:"])
+    has_decisions = String.contains?(text, ["\"decisions\"", "decisions:"])
+
+    has_random and has_mapping and has_decisions
   end
 
   defp unwrap_answer_json(text) do
@@ -1490,6 +1521,7 @@ defmodule AntiAgents.Frontier do
     frontier_report = %FrontierReport{
       field: field,
       exemplars: accepted,
+      reachable_archive: report.reachable_archive,
       delta_frontier: Float.round(delta * 1.0, 3),
       reachable_hits: reachable_hits,
       rejected_duplicates: rejected_duplicates,

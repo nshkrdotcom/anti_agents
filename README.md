@@ -192,9 +192,10 @@ mix anti_agents.frontier "the memory of a color that doesn't exist" \
   --temperature 1.18 \
   --model gpt-5.4-mini \
   --reasoning low \
-  --baseline plain,paraphrase,temp:0.8|1.0 \
+  --baseline 'plain,paraphrase,temp:0.8|1.0' \
   --toward "machine pastoral" \
   --away-from "standard sci-fi" \
+  --preview-chars 180 \
   --out trace.json
 ```
 
@@ -206,7 +207,8 @@ heartbeats with in-flight work, and truncated input/output previews. Use
 
 The `--out` path receives a structured JSON trace (`AntiAgents.Trace`) that includes
 the synthesis claim under test, run parameters, evidence summary (`meaningful_signal`,
-`delta_frontier`, `mean_seed_coverage`), and per-exemplar mapping audit trails.
+`delta_frontier`, `mean_seed_coverage`), the clean `reachable_archive`, and
+per-exemplar mapping audit trails.
 
 ## Anti-collapse policy
 

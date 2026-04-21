@@ -28,6 +28,7 @@ defmodule AntiAgents.Trace do
       "run" => run(opts),
       "metrics" => json_safe(report.metrics),
       "evidence" => evidence(report),
+      "reachable_archive" => Enum.map(report.reachable_archive, &burst(&1, include_raw)),
       "exemplars" => Enum.map(report.exemplars, &burst(&1, include_raw)),
       "rejected_duplicates" => Enum.map(report.rejected_duplicates, &burst(&1, include_raw)),
       "reachable_hits" => json_safe(report.reachable_hits),
@@ -108,6 +109,7 @@ defmodule AntiAgents.Trace do
       "meaningful_signal" =>
         accepted_count > 0 and report.delta_frontier > 0 and seed_coverage >= 0.25,
       "accepted_frontier_count" => accepted_count,
+      "reachable_baseline_count" => length(report.reachable_archive),
       "rejected_duplicate_or_reachable_count" => rejected_count,
       "mapping_trace_count" => length(report.mapping_traces),
       "delta_frontier" => report.delta_frontier,

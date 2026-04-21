@@ -358,6 +358,7 @@ defmodule AntiAgentsTest do
       assert report.field == field
       assert is_float(report.delta_frontier)
       assert is_list(report.exemplars)
+      assert is_list(report.reachable_archive)
       assert is_list(report.mapping_traces)
       assert Map.has_key?(report.metrics, :distinct)
       assert Map.has_key?(report.metrics, :archive_coverage)
@@ -411,7 +412,7 @@ defmodule AntiAgentsTest do
 
       Enum.each(baseline_calls, fn {prompt, opts} ->
         refute Keyword.has_key?(opts, :output_schema)
-        assert String.contains?(prompt, "Return plain text only")
+        assert String.contains?(prompt, "Return only the answer text")
         refute String.contains?(opts[:input], "Coordinate nonce:")
       end)
 
@@ -526,6 +527,9 @@ defmodule AntiAgentsTest do
       assert Scoring.artifact_answer?(answer)
       refute Scoring.artifact_answer?(~s({"ordinary":"json","payload":true}))
       assert Scoring.artifact_answer?("Coordinate nonce: abc Field prompt: leaked")
+      assert Scoring.artifact_answer?(~s({"random_string":"abc","mapping":{"decisions":[))
+      assert Scoring.artifact_answer?("```bash\nmix anti_agents.frontier demo\n```")
+      assert Scoring.artifact_answer?("A refined version of the prompt: better words")
     end
 
     test "cleans answer-only JSON and rejects nested control JSON in plain answers" do
@@ -669,6 +673,7 @@ defmodule AntiAgentsTest do
       report = %FrontierReport{
         field: field,
         exemplars: [burst],
+        reachable_archive: [burst],
         delta_frontier: 1.0,
         mapping_traces: [burst.mapping_trace],
         metrics: %{distinct: 1, coherence: 0.8, seed_coverage: 0.5, archive_coverage: 1.0}
@@ -679,6 +684,8 @@ defmodule AntiAgentsTest do
       assert trace["synthesis"]["essential_aspect"] =~ "entropy-first"
       assert trace["run"]["model"] == "gpt-5.4-mini"
       assert trace["evidence"]["meaningful_signal"] == true
+      assert trace["evidence"]["reachable_baseline_count"] == 1
+      assert length(trace["reachable_archive"]) == 1
       assert hd(trace["exemplars"])["random_string"] == "abcdef123456"
       refute Map.has_key?(hd(trace["exemplars"]), "raw_output")
     end
