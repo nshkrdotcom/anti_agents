@@ -199,7 +199,8 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
           run_reports(fields, config, progress_opts, calls_per_run, planned_llm_calls)
         end)
 
-      hypothesis = aggregate_hypothesis(reports, config)
+      calibration_status = calibration_status(reports)
+      hypothesis = aggregate_hypothesis(reports, config, calibration_status)
       pooled_hypothesis = pooled_hypothesis(reports, config)
 
       emit(
@@ -216,7 +217,7 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
           "evidence" => %{
             "hypothesis_test" => hypothesis,
             "pooled_hypothesis_test" => pooled_hypothesis,
-            "calibration_status" => calibration_status(reports)
+            "calibration_status" => calibration_status
           },
           "runs" => Enum.map(reports, &benchmark_run_trace/1)
         },
@@ -363,26 +364,13 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     ]
   end
 
-  defp aggregate_hypothesis(reports, config) do
-    deltas = Enum.map(reports, &AntiAgents.Statistics.per_field_delta(&1.report))
-
-    mean_ci =
-      AntiAgents.Statistics.mean_delta_ci(deltas, resamples: config.bootstrap_resamples, seed: 41)
-
-    sign_test = AntiAgents.Statistics.sign_test(deltas)
-    lower_bound = hd(mean_ci.bootstrap_ci_95)
-
-    %{
-      aggregation: "per_field",
-      delta_observations: deltas,
-      mean_delta: mean_ci.mean_delta,
-      bootstrap_ci_95: mean_ci.bootstrap_ci_95,
-      sign_test_p: sign_test.p_value,
-      sign_test: sign_test,
-      rejects_null: lower_bound > 0 and sign_test.p_value < 0.05,
-      n_observations: mean_ci.n_observations,
-      n_resamples: config.bootstrap_resamples
-    }
+  defp aggregate_hypothesis(reports, config, calibration_status) do
+    reports
+    |> Enum.map(&AntiAgents.Statistics.per_field_delta(&1.report))
+    |> AntiAgents.Statistics.evidence_hypothesis(calibration_status,
+      resamples: config.bootstrap_resamples,
+      seed: 41
+    )
   end
 
   defp pooled_hypothesis(reports, config) do

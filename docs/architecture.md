@@ -33,6 +33,8 @@ Field
 - Trace writer: JSON evidence report.
 - Frontier Mix task: single-field CLI.
 - Benchmark Mix task: multi-field matched-budget benchmark CLI.
+- Ablation Mix task: offline descriptor-view comparison against a saved
+  reference trace, with `provider_calls: 0`.
 
 ## Statistical Pipeline
 
@@ -44,12 +46,16 @@ burst
   -> per-field delta
   -> bootstrap CI over mean delta
   -> one-sided sign test
+  -> calibration-status gate
   -> aggregate rejects_null decision
 ```
 
 The pooled distinct-cell statistic is retained only as a diagnostic field. The
 headline benchmark decision uses per-field/repetition deltas so cells from
 different prompts do not collide in one shared surface bucket vocabulary.
+`rejects_null` is true only when the mean-delta lower CI bound is positive, the
+one-sided sign test is below 0.05, and benchmark calibration status is not
+`descriptor_saturated`.
 
 Descriptor saturation is tracked separately through `empirical_cell_space`,
 `saturation`, and `cell_saturation_warning`. If too many runs saturate the
@@ -61,6 +67,12 @@ are embedded with Gemini, fitted into centroids, and then reused to assign
 integer `semantic_cluster` values to baseline, frontier, and matched-baseline
 outputs. If the embedding provider is missing or fails, the descriptor status
 degrades explicitly and `semantic_cluster` remains `:unknown`.
+
+`mix anti_agents.ablate` reads a reference trace and recomputes per-run deltas
+from the recorded `exemplars` and `matched_baseline_archive`. In `jaccard`
+mode, semantic cluster identity is ignored; in `embedding` mode, semantic
+clusters already present in the trace are retained. The task never calls
+Codex or Gemini and reports directional agreement between descriptor views.
 
 ## Boundary
 

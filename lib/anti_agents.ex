@@ -902,8 +902,11 @@ defmodule AntiAgents.Scoring do
     backend = opts |> Keyword.get(:distance, :jaccard) |> Distance.resolve()
 
     case backend.pairwise(a, b, opts) do
-      {:ok, value} -> value
-      {:error, _reason} -> Distance.Jaccard.similarity(a, b)
+      {:ok, value} ->
+        value
+
+      {:error, reason} ->
+        raise ArgumentError, "distance backend #{inspect(backend)} failed: #{inspect(reason)}"
     end
   end
 

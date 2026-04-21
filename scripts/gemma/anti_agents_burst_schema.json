@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "properties": {
+    "random_string": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "mapping": {
+      "type": "object",
+      "properties": {
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "axis": {
+                "type": "string"
+              },
+              "chunk": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "hash": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 996
+              },
+              "choice": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 6
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": ["axis", "chunk", "hash", "choice", "value"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["decisions"],
+      "additionalProperties": false
+    },
+    "answer": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": ["random_string", "mapping", "answer"],
+  "additionalProperties": false
+}

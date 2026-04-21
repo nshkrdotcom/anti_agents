@@ -269,43 +269,43 @@ suppressed.
 
 #### Diagnostic
 
-A 12-field diagnostic smoke benchmark was run with one plain baseline, one
-frontier burst, one matched-baseline continuation, and 200 bootstrap resamples
-per run:
+A one-field live provider smoke was run with one plain baseline, one SSoT
+frontier burst, embedding descriptors, and 200 bootstrap resamples. This is a
+plumbing check only; it is deliberately below the benchmark budget.
 
 ```json
 {
-  "field_count": 12,
+  "trace": "tmp/anti_agents_benchmark_smoke_embedding_one_field.json",
+  "field_count": 1,
   "repetitions": 1,
-  "planned_llm_calls": 36,
-  "accepted_frontier_runs": 3,
-  "adjusted_novel_frontier_cell_total": 3,
-  "baseline_retry_total": 3,
-  "baseline_permanent_loss_total": 0,
-  "hypothesis_test": {
-    "frontier_cell_count": 2,
-    "matched_baseline_cell_count": 2,
-    "delta_distinct_cells": 0,
-    "bootstrap_ci_95": [-1.0, 1.0],
-    "rejects_null": false,
-    "n_resamples": 200
-  }
+  "planned_llm_calls": 3,
+  "mode": "benchmark_diagnostic",
+  "embedding": {
+    "client": "gemini_ex",
+    "model": "gemini-embedding-001",
+    "auth": "gemini",
+    "dimensions": 768
+  },
+  "semantic_descriptor_status": "embedding",
+  "integer_semantic_clusters_seen": [0],
+  "accepted_frontier_count": 0,
+  "rejected_frontier_reason": "random string copied coordinate nonce"
 }
 ```
 
-Interpretation. The benchmark plumbing worked and produced an auditable trace,
-but this small smoke run does **not** support the positive research hypothesis:
-the aggregate frontier did not exceed the matched baseline in distinct-cell
-count. That is expected for a deliberately tiny `branching: 1` smoke test; the
-result is useful as a harness check, not as evidence of frontier advantage.
-Current builds require `--diagnostic` for any `--branching < 4` benchmark run,
+Interpretation. The provider path worked: Codex produced the live calls,
+Gemini embeddings were configured and used, and descriptor status was
+`embedding`. The burst was rejected by an anti-collapse guard because it copied
+the host coordinate nonce. That is not a failure of the provider path; it is
+exactly the kind of invalid SSoT behaviour this harness is intended to expose.
+Current builds require `--diagnostic` for any `--branching < 4` benchmark run
 and mark such traces as `mode: "benchmark_diagnostic"`.
 
 For diagnostic smoke runs, use verbose mode:
 
 ```bash
 mix anti_agents.benchmark \
-  --fields priv/benchmarks/fields_v1.json \
+  --fields tmp/anti_agents_fields_one.json \
   --diagnostic \
   --branching 1 \
   --repetitions 1 \
@@ -313,12 +313,15 @@ mix anti_agents.benchmark \
   --model gpt-5.4-mini \
   --reasoning low \
   --temperature 1.05 \
+  --distance embedding \
+  --embedding-model gemini-embedding-001 \
+  --embedding-auth gemini \
   --bootstrap-resamples 200 \
   --timeout-ms 240000 \
   --verbose \
   --heartbeat-ms 5000 \
   --preview-chars 180 \
-  --out tmp/anti_agents_benchmark_smoke.json
+  --out tmp/anti_agents_benchmark_smoke_embedding_one_field.json
 ```
 
 Verbose benchmark logs intentionally report both global and local progress:
@@ -359,8 +362,53 @@ mix anti_agents.benchmark \
   --profile priv/profiles/evidence.json \
   --fields priv/benchmarks/fields_v1.json \
   --expensive \
-  --out tmp/anti_agents_evidence.json
+  --verbose \
+  --heartbeat-ms 5000 \
+  --preview-chars 180 \
+  --out tmp/anti_agents_evidence_YYYYMMDD.json
 ```
+
+The prepared dry-run for that profile reports:
+
+```json
+{
+  "trace": "tmp/anti_agents_evidence_dry_run.json",
+  "profile_id": "evidence-v1",
+  "field_count": 12,
+  "repetitions": 3,
+  "baseline_calls_per_run": 5,
+  "frontier_bursts_per_run": 8,
+  "matched_baseline_calls_per_run": 8,
+  "planned_llm_calls": 756,
+  "expected_single_view_embedding_calls": "<= 756",
+  "model": "gpt-5.4",
+  "reasoning_effort": "high",
+  "thinking_budget": 4000,
+  "embedding_auth": "gemini"
+}
+```
+
+Do not run this from automation unless the full cost is intentional. After a
+human produces `tmp/anti_agents_evidence_YYYYMMDD.json`, accept the result only
+if `mode == "benchmark_report"`, `run.profile_id == "evidence-v1"`,
+`run.profile_overrides == {}`, `evidence.calibration_status == "ok"`, and
+`evidence.hypothesis_test.rejects_null` is reported as a boolean. A `false`
+value is still a valid result.
+
+After the evidence trace exists, run descriptor ablation offline:
+
+```bash
+mix anti_agents.ablate \
+  --fields priv/benchmarks/fields_v1.json \
+  --branching 8 \
+  --repetitions 3 \
+  --reference-trace tmp/anti_agents_evidence_YYYYMMDD.json \
+  --modes jaccard,embedding \
+  --out tmp/anti_agents_ablation_YYYYMMDD.json
+```
+
+If `summary.directional_agreement < 0.7`, report the benchmark result as
+descriptor-specific rather than backend-independent.
 
 Profile values provide defaults and CLI flags override them. Overrides are
 recorded in the trace under `run.profile_overrides`.
@@ -369,8 +417,12 @@ The evidence profile defaults to:
 
 ```json
 {
+  "model": "gpt-5.4",
+  "reasoning_effort": "high",
+  "thinking_budget": 4000,
   "distance": "embedding",
   "embedding_model": "gemini-embedding-001",
+  "embedding_auth": "gemini",
   "embedding_task_type": "clustering",
   "embedding_dimensions": 768
 }
@@ -378,6 +430,20 @@ The evidence profile defaults to:
 
 Set `GEMINI_API_KEY` or the Vertex credentials supported by `gemini_ex` before
 running it live.
+
+Model policy:
+
+- Use `gpt-5.4-mini` with `--reasoning low` for short smoke tests,
+  parser/config checks, progress-log checks, and other plumbing diagnostics.
+- Use `priv/profiles/evidence.json` unchanged for citeable evidence. That
+  profile currently uses `gpt-5.4`, `reasoning_effort: "high"`, and
+  `thinking_budget: 4000`.
+- Do not cite diagnostic numbers from `gpt-5.4-mini` / low-reasoning runs as
+  evidence. They are useful only for proving the harness and provider paths
+  are wired correctly.
+- Changing model, reasoning effort, or thinking budget changes the
+  experimental instrument, because SSoT depends on the model reliably emitting
+  a random string, using local chunks, and producing a valid mapping trace.
 
 ## Mechanism
 
@@ -536,9 +602,9 @@ comparison = AntiAgents.compare(field, branching: 12, baseline: [:plain, :paraph
 | `embedding_dimensions` | `768` | Gemini output dimensionality; non-3072 vectors are normalized before use |
 | `frontier_temperature_sweep` | `[]` | optional round-robin temperatures for frontier bursts |
 | `coordinate` | `[length: 32, chunk: 5]` | seed length and chunk size |
-| `thinking_budget` | `1200` | `max_tokens` forwarded to the model |
-| `model` | `"gpt-5.4-mini"` | Codex model string |
-| `reasoning_effort` | `:low` | reasoning effort forwarded to Codex |
+| `thinking_budget` | `1200` | `max_tokens` forwarded to the model; smoke default only, evidence uses `4000` from `priv/profiles/evidence.json` |
+| `model` | `"gpt-5.4-mini"` | Codex model string; smoke/default only, evidence uses `gpt-5.4` from `priv/profiles/evidence.json` |
+| `reasoning_effort` | `:low` | reasoning effort forwarded to Codex; smoke/default only, evidence uses `:high` from `priv/profiles/evidence.json` |
 | `client` | default Codex client | injected module used for provider calls in tests or custom integrations |
 
 ## Output schema
@@ -698,6 +764,25 @@ in-flight heartbeat state, and truncated prompt/output previews. A repeated
 the local maximum plan for the current field/repetition and is prefixed with
 `benchmark run X/Y field=...` to make that explicit. The actual local total can
 be lower if frontier bursts are rejected before matched-baseline continuation.
+
+To compare descriptor assumptions without spending additional provider calls,
+run an offline ablation against a saved benchmark trace:
+
+```bash
+mix anti_agents.ablate \
+  --fields priv/benchmarks/fields_v1.json \
+  --branching 8 \
+  --repetitions 3 \
+  --reference-trace tmp/anti_agents_benchmark.json \
+  --modes jaccard,embedding \
+  --out tmp/anti_agents_ablation.json
+```
+
+The ablation task reads the recorded `exemplars` and
+`matched_baseline_archive`, sets `provider_calls` to `0`, and reports per-run
+`delta_jaccard`, `delta_embedding`, and `directional_agreement`. The embedding
+mode uses semantic-cluster cells already present in the trace; it does not
+create new embeddings.
 
 ## Anti-collapse policy
 

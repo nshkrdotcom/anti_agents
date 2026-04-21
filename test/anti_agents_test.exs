@@ -6,6 +6,7 @@ defmodule AntiAgentsTest do
   alias AntiAgents.{BurstResult, Field, FrontierReport}
   alias AntiAgents.{Bursts, Distance, Progress, Scoring, Statistics}
   alias AntiAgents.Embedding.GeminiClient
+  alias Mix.Tasks.AntiAgents.Ablate, as: AblateTask
   alias Mix.Tasks.AntiAgents.Benchmark, as: BenchmarkTask
   alias Mix.Tasks.AntiAgents.Calibrate, as: CalibrateTask
   alias Mix.Tasks.AntiAgents.Frontier, as: FrontierTask
@@ -265,6 +266,10 @@ defmodule AntiAgentsTest do
 
       {:ok, vectors}
     end
+  end
+
+  defmodule FailingEmbeddingClient do
+    def embed(_texts, _opts), do: {:error, :embedding_provider_down}
   end
 
   defmodule FakeGeminiEmbeddingAPI do
@@ -576,6 +581,15 @@ defmodule AntiAgentsTest do
                Distance.Judge.pairwise("a", "b", [])
     end
 
+    test "embedding similarity errors are not silently downgraded to jaccard" do
+      assert_raise ArgumentError, ~r/distance backend AntiAgents.Distance.Embedding failed/, fn ->
+        Scoring.similarity("same tokens", "same tokens",
+          distance: :embedding,
+          embedding_client: FailingEmbeddingClient
+        )
+      end
+    end
+
     test "gemini embedding client batch embeds with model options and normalizes short vectors" do
       assert {:ok, [cat, ocean]} =
                GeminiClient.embed(["cat", "ocean"],
@@ -622,6 +636,36 @@ defmodule AntiAgentsTest do
       assert first.cell.semantic_cluster == nearby.cell.semantic_cluster
       refute first.cell.semantic_cluster == distant.cell.semantic_cluster
       assert degraded.cell.semantic_cluster == :unknown
+    end
+
+    test "frontier records degraded semantic descriptor status when embeddings fail" do
+      field = AntiAgents.field("embedding degradation", axes: [:ontology, :metaphor, :closure])
+
+      report =
+        AntiAgents.frontier(field,
+          client: BurstClient,
+          baseline: [:plain],
+          branching: 1,
+          matched_budget: false,
+          distance: :embedding,
+          embedding_client: FailingEmbeddingClient,
+          coordinate: [length: 12, chunk: 4]
+        )
+
+      assert report.semantic_descriptor_status == :degraded
+      assert report.semantic_centroid_ids == []
+
+      trace =
+        AntiAgents.Trace.report(report,
+          distance: :embedding,
+          embedding_client: GeminiClient,
+          embedding_model: "gemini-embedding-001",
+          embedding_task_type: :clustering,
+          embedding_dimensions: 768
+        )
+
+      assert trace["run"]["semantic_descriptor_status"] == "degraded"
+      assert trace["run"]["centroids"]["ids"] == []
     end
 
     test "scoring weights sum to one and match documented components" do
@@ -702,6 +746,32 @@ defmodule AntiAgentsTest do
       assert ci.mean_delta == 0.0
       refute hd(ci.bootstrap_ci_95) > 0
       assert sign.p_value >= 0.05
+    end
+
+    test "evidence hypothesis requires positive CI, sign test, and non-saturated calibration" do
+      positive =
+        Statistics.evidence_hypothesis([1, 1, 1, 1, 1, 1], "ok",
+          resamples: 200,
+          seed: 12
+        )
+
+      saturated =
+        Statistics.evidence_hypothesis([1, 1, 1, 1, 1, 1], "descriptor_saturated",
+          resamples: 200,
+          seed: 12
+        )
+
+      zero_signal =
+        Statistics.evidence_hypothesis(List.duplicate(0, 12), "ok",
+          resamples: 200,
+          seed: 12
+        )
+
+      assert positive.rejects_null == true
+      assert saturated.rejects_null == false
+      assert saturated.calibration_status == "descriptor_saturated"
+      assert zero_signal.rejects_null == false
+      assert zero_signal.sign_test_p == 1.0
     end
 
     test "frontier report has explicit fields" do
@@ -1295,6 +1365,77 @@ defmodule AntiAgentsTest do
                {:error, :artifact_answer}
     end
 
+    test "anti-collapse threshold accepts exactly at max two or one third chunks" do
+      random_string = "abcd1234efgh5678ijkl9012mnop3456qrst7890"
+      chunk_size = 4
+
+      at_threshold =
+        random_string
+        |> valid_burst_map("At-threshold answer.",
+          axes: ["ontology", "metaphor", "syntax", "closure"],
+          chunks: [0, 3, 6, 9],
+          chunk_size: chunk_size
+        )
+        |> get_in(["mapping"])
+
+      below_threshold =
+        random_string
+        |> valid_burst_map("Below-threshold answer.",
+          axes: ["ontology", "metaphor", "closure"],
+          chunks: [0, 4, 9],
+          chunk_size: chunk_size
+        )
+        |> get_in(["mapping"])
+
+      at_threshold_verification = Scoring.verify_mapping(at_threshold, random_string, chunk_size)
+
+      below_threshold_verification =
+        Scoring.verify_mapping(below_threshold, random_string, chunk_size)
+
+      assert at_threshold_verification.chunk_count == 10
+      assert at_threshold_verification.verified_chunk_count == 4
+      refute Scoring.verified_anti_collapse_fail?(at_threshold_verification)
+
+      assert below_threshold_verification.verified_chunk_count == 3
+      assert Scoring.verified_anti_collapse_fail?(below_threshold_verification)
+    end
+
+    test "verify_mapping remains valid and non-decreasing as valid local decisions are added" do
+      random_string = "abcd1234efgh5678ijkl9012mnop3456"
+      chunk_size = 4
+
+      base =
+        random_string
+        |> valid_burst_map("Base answer.",
+          axes: ["ontology", "metaphor", "closure"],
+          chunks: [0, 2, 4],
+          chunk_size: chunk_size
+        )
+        |> get_in(["mapping"])
+
+      additions =
+        random_string
+        |> valid_burst_map("Extended answer.",
+          axes: ["syntax", "affect"],
+          chunks: [6, 7],
+          chunk_size: chunk_size
+        )
+        |> get_in(["mapping", "decisions"])
+
+      base_verification = Scoring.verify_mapping(base, random_string, chunk_size)
+
+      extended_verification =
+        base
+        |> update_in(["decisions"], &(&1 ++ additions))
+        |> Scoring.verify_mapping(random_string, chunk_size)
+
+      assert base_verification.valid? == true
+      assert extended_verification.valid? == true
+      assert extended_verification.verified_chunk_count >= base_verification.verified_chunk_count
+      assert extended_verification.coverage >= base_verification.coverage
+      refute Scoring.verified_anti_collapse_fail?(extended_verification)
+    end
+
     test "verify_mapping reports non-map, invalid axis, and invalid chunk cases" do
       assert Scoring.verify_mapping("bad", "abcdef", 3).valid? == false
 
@@ -1608,6 +1749,75 @@ defmodule AntiAgentsTest do
       assert trace["field"]["prompt"] == "dry out"
     after
       File.rm("tmp/test_dry_run_trace.json")
+    end
+
+    test "mix ablate re-scores a reference trace without provider calls" do
+      Mix.Task.reenable("anti_agents.ablate")
+      trace_path = "tmp/test_ablation_reference.json"
+      out_path = "tmp/test_ablation_report.json"
+      File.rm(out_path)
+
+      File.write!(
+        trace_path,
+        Jason.encode!(%{
+          "schema_version" => 1,
+          "mode" => "benchmark_report",
+          "runs" => [
+            synthetic_ablation_run(
+              "field-a",
+              1,
+              [
+                {"extended", "small", 0},
+                {"extended", "small", 1}
+              ],
+              [
+                {"extended", "small", 0}
+              ]
+            ),
+            synthetic_ablation_run(
+              "field-b",
+              1,
+              [
+                {"short", "single", 2}
+              ],
+              []
+            )
+          ]
+        })
+      )
+
+      output =
+        capture_io(fn ->
+          AblateTask.run([
+            "--reference-trace",
+            trace_path,
+            "--modes",
+            "jaccard,embedding",
+            "--out",
+            out_path
+          ])
+        end)
+
+      assert output =~ "Wrote AntiAgents ablation trace to #{out_path}"
+      assert {:ok, report} = out_path |> File.read!() |> Jason.decode()
+      assert report["mode"] == "ablation_report"
+      assert report["provider_calls"] == 0
+      assert report["run_count"] == 2
+
+      assert report["runs"] |> Enum.at(0) |> Map.take(["delta_jaccard", "delta_embedding"]) == %{
+               "delta_jaccard" => 0,
+               "delta_embedding" => 1
+             }
+
+      assert report["runs"] |> Enum.at(0) |> Map.get("directional_agreement") == false
+      assert report["runs"] |> Enum.at(1) |> Map.get("directional_agreement") == true
+      assert report["summary"]["directional_agreement"] == 0.5
+      assert report["summary"]["passes_directional_agreement_bar"] == false
+      assert report["summary"]["mean_delta_jaccard"] == 0.5
+      assert report["summary"]["mean_delta_embedding"] == 1.0
+    after
+      File.rm("tmp/test_ablation_reference.json")
+      File.rm("tmp/test_ablation_report.json")
     end
 
     test "mix benchmark dry-run reports fields, repetitions, and planned calls" do
@@ -2274,5 +2484,29 @@ defmodule AntiAgentsTest do
       1_000 ->
         flunk("expected #{count} more slow client calls")
     end
+  end
+
+  defp synthetic_ablation_run(field_id, repetition, frontier_cells, matched_cells) do
+    %{
+      "field_id" => field_id,
+      "repetition" => repetition,
+      "exemplars" => Enum.map(frontier_cells, &synthetic_ablation_burst/1),
+      "matched_baseline_archive" => Enum.map(matched_cells, &synthetic_ablation_burst/1)
+    }
+  end
+
+  defp synthetic_ablation_burst({length, sentence_count, semantic_cluster}) do
+    %{
+      "answer" => "#{length} #{sentence_count} #{semantic_cluster}",
+      "descriptor" => %{
+        "cell" => %{
+          "length" => length,
+          "sentence_count" => sentence_count,
+          "affect" => "low",
+          "abstraction" => "mid",
+          "semantic_cluster" => semantic_cluster
+        }
+      }
+    }
   end
 end

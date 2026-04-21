@@ -28,6 +28,7 @@ mix anti_agents.benchmark \
   --repetitions 3 \
   --distance embedding \
   --embedding-model gemini-embedding-001 \
+  --embedding-auth gemini \
   --embedding-task-type clustering \
   --embedding-dimensions 768 \
   --frontier-temperature-sweep '1.0|1.1|1.2' \
@@ -37,6 +38,34 @@ mix anti_agents.benchmark \
 
 Use `--dry-run` first to inspect provider call count. Larger runs must pass
 `--expensive`.
+
+## Model And Reasoning Policy
+
+Diagnostic runs may use `gpt-5.4-mini` with `--reasoning low`. This is the
+cheap path for parser tests, progress logging, trace shape, Gemini embedding
+plumbing, and short smoke runs. Diagnostic output is not evidence.
+
+Evidence runs must use `priv/profiles/evidence.json` without model overrides.
+The current evidence profile uses:
+
+```json
+{
+  "model": "gpt-5.4",
+  "reasoning_effort": "high",
+  "thinking_budget": 4000,
+  "distance": "embedding",
+  "embedding_model": "gemini-embedding-001",
+  "embedding_auth": "gemini",
+  "embedding_task_type": "clustering",
+  "embedding_dimensions": 768
+}
+```
+
+This matters because SSoT is part of the measured instrument. A model with
+weaker reasoning can fail by emitting poor random strings, ignoring local
+chunks, producing invalid hash mappings, or collapsing to prefix-only
+strategies. Changing `model`, `reasoning_effort`, or `thinking_budget` creates
+a different experiment and must not be mixed with evidence-profile results.
 
 The evidence profile configures `AntiAgents.Embedding.GeminiClient`, which uses
 `gemini_ex` batch embeddings. A live evidence run requires `GEMINI_API_KEY` or
@@ -64,11 +93,33 @@ Any cited benchmark number requires:
 - `branching >= 6`
 - `repetitions >= 3`
 - `--profile priv/profiles/evidence.json`
+- no model, reasoning, or thinking-budget overrides from the evidence profile
 - `--distance embedding` with integer `semantic_cluster` descriptor values
 - Gemini embedding metadata recorded in `run.embedding`
 - explicit frontier temperature points recorded as `frontier_temperature_points`
 - a non-diagnostic output mode
 - a calibration run that passed on the same calendar day
+
+## Descriptor Ablation
+
+After producing an evidence-profile trace, run descriptor ablation offline:
+
+```bash
+mix anti_agents.ablate \
+  --fields priv/benchmarks/fields_v1.json \
+  --branching 8 \
+  --repetitions 3 \
+  --reference-trace tmp/anti_agents_benchmark.json \
+  --modes jaccard,embedding \
+  --out tmp/anti_agents_ablation.json
+```
+
+The ablation task must report `provider_calls: 0`. It reuses the same recorded
+frontier and matched-baseline bursts, so the only changed variable is the
+descriptor view. The acceptance bar for descriptor robustness is
+`summary.directional_agreement >= 0.7`. If directional agreement is below 0.7,
+the evidence claim must be scoped to the descriptor backend that produced it
+rather than presented as backend-independent.
 
 ## Baseline Integrity
 

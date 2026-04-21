@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-04-21
+
+- P1: Added a repo-local Gemma server helper and optional SSoT JSON schema for
+  local OpenAI-compatible experiments; Codex/Gemini remains the evidence path.
+- P2: Made `distance: embedding` fail loudly on backend errors, retained
+  degraded semantic-descriptor status in traces, and exposed centroid IDs under
+  `run.centroids`.
+- P3: Hardened SSoT anti-collapse coverage with boundary tests for chunk
+  thresholds and monotonic verified mapping coverage.
+- P4: Centralized the evidence gate in `AntiAgents.Statistics.evidence_hypothesis/3`
+  so benchmark and calibration both require positive CI, sign-test support, and
+  non-saturated calibration status.
+- P5: Added `mix anti_agents.ablate` for offline descriptor ablation against
+  reference traces with `provider_calls: 0`.
+- P6: Ran the allowed one-field live smoke with Codex inference and
+  `gemini_ex` embeddings; recorded explicit Gemini auth and descriptor
+  provenance.
+- P7: Prepared and dry-run validated the 156-call live calibration command;
+  deferred execution to the human operator under the live-run budget policy.
+- P8: Dry-run validated the evidence profile at 756 planned LLM calls and
+  `<= 756` expected single-view embedding calls; documented human-run evidence
+  and ablation commands.
+- P9: Updated README, validation, and architecture docs to distinguish pilot,
+  diagnostic smoke, deferred evidence, and descriptor-ablation claims.
+
 ## 2026-04-20
 
 - W1: Added matched-budget hypothesis testing, bootstrap confidence intervals,

@@ -112,6 +112,35 @@ defmodule AntiAgents.Statistics do
   end
 
   @doc """
+  Computes the benchmark-level evidence gate from per-field deltas.
+
+  The gate is deliberately stricter than a positive bootstrap interval:
+  evidence requires a positive mean-delta confidence lower bound, a one-sided
+  sign-test p-value below 0.05, and a non-saturated descriptor instrument.
+  """
+  @spec evidence_hypothesis([number()], String.t(), keyword()) :: map()
+  def evidence_hypothesis(deltas, calibration_status, opts \\ []) when is_list(deltas) do
+    mean_ci = mean_delta_ci(deltas, opts)
+    sign_test = sign_test(deltas)
+    lower_bound = hd(mean_ci.bootstrap_ci_95)
+
+    %{
+      aggregation: "per_field",
+      delta_observations: deltas,
+      mean_delta: mean_ci.mean_delta,
+      bootstrap_ci_95: mean_ci.bootstrap_ci_95,
+      sign_test_p: sign_test.p_value,
+      sign_test: sign_test,
+      calibration_status: calibration_status,
+      rejects_null:
+        lower_bound > 0 and sign_test.p_value < 0.05 and
+          calibration_status != "descriptor_saturated",
+      n_observations: mean_ci.n_observations,
+      n_resamples: mean_ci.n_resamples
+    }
+  end
+
+  @doc """
   One-sided sign test for H0 median(delta) <= 0.
 
   Zeros are recorded but excluded from the binomial test.

@@ -98,7 +98,8 @@ defmodule AntiAgents.Trace do
       "thinking_budget" => Keyword.get(opts, :thinking_budget, 1200),
       "embedding" => embedding_summary(opts),
       "semantic_descriptor_status" => semantic_descriptor_status(report),
-      "semantic_centroid_ids" => semantic_centroid_ids(report)
+      "semantic_centroid_ids" => semantic_centroid_ids(report),
+      "centroids" => %{"ids" => semantic_centroid_ids(report)}
     }
   end
 

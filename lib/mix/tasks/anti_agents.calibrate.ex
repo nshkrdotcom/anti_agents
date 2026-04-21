@@ -55,9 +55,11 @@ defmodule Mix.Tasks.AntiAgents.Calibrate do
 
   defp stubbed_report do
     deltas = [2, 2, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1]
-    mean_ci = AntiAgents.Statistics.mean_delta_ci(deltas, resamples: 1_000, seed: 99)
-    sign_test = AntiAgents.Statistics.sign_test(deltas)
-    lower_bound = hd(mean_ci.bootstrap_ci_95)
+
+    hypothesis =
+      deltas
+      |> AntiAgents.Statistics.evidence_hypothesis("ok", resamples: 1_000, seed: 99)
+      |> json_roundtrip()
 
     %{
       "schema_version" => 1,
@@ -65,20 +67,16 @@ defmodule Mix.Tasks.AntiAgents.Calibrate do
       "stubbed" => true,
       "claim" => "positive-control frontier arm must beat matched baseline on per-field deltas",
       "evidence" => %{
-        "hypothesis_test" => %{
-          "aggregation" => "per_field",
-          "delta_observations" => deltas,
-          "mean_delta" => mean_ci.mean_delta,
-          "bootstrap_ci_95" => mean_ci.bootstrap_ci_95,
-          "sign_test_p" => sign_test.p_value,
-          "sign_test" => sign_test,
-          "rejects_null" => lower_bound > 0 and sign_test.p_value < 0.05,
-          "n_observations" => mean_ci.n_observations,
-          "n_resamples" => mean_ci.n_resamples
-        },
+        "hypothesis_test" => hypothesis,
         "calibration_status" => "ok"
       }
     }
+  end
+
+  defp json_roundtrip(value) do
+    value
+    |> Jason.encode!()
+    |> Jason.decode!()
   end
 
   defp emit(report, nil), do: Mix.shell().info(Jason.encode!(report, pretty: true))
