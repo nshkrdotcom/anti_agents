@@ -671,6 +671,8 @@ end
 defmodule AntiAgents.Scoring do
   @moduledoc false
 
+  alias AntiAgents.Distance
+
   def extract_text(%{final_response: final_response}), do: extract_text(final_response)
   def extract_text(%{content: text}) when is_binary(text), do: {:ok, text}
   def extract_text(%{"content" => text}) when is_binary(text), do: {:ok, text}
@@ -860,11 +862,11 @@ defmodule AntiAgents.Scoring do
   end
 
   def similarity(a, b, opts \\ []) do
-    backend = opts |> Keyword.get(:distance, :jaccard) |> AntiAgents.Distance.resolve()
+    backend = opts |> Keyword.get(:distance, :jaccard) |> Distance.resolve()
 
     case backend.pairwise(a, b, opts) do
       {:ok, value} -> value
-      {:error, _reason} -> AntiAgents.Distance.Jaccard.similarity(a, b)
+      {:error, _reason} -> Distance.Jaccard.similarity(a, b)
     end
   end
 
@@ -1875,9 +1877,7 @@ defmodule AntiAgents.Frontier do
   end
 
   defp cell_label(cell) when is_map(cell) do
-    cell
-    |> Enum.map(fn {key, value} -> "#{key}=#{value}" end)
-    |> Enum.join("/")
+    Enum.map_join(cell, "/", fn {key, value} -> "#{key}=#{value}" end)
   end
 
   defp cell_label(cell), do: inspect(cell)
@@ -2024,57 +2024,47 @@ defmodule AntiAgents.Frontier do
     retry_budget = Keyword.get(opts, :baseline_retry_budget, 2)
 
     baseline_burst_attempt(
-      field,
-      method,
-      client,
-      method_opts,
-      input,
-      index,
-      total,
-      total_llm_calls,
-      retry_budget,
+      %{
+        field: field,
+        method: method,
+        client: client,
+        method_opts: method_opts,
+        input: input,
+        index: index,
+        total: total,
+        total_llm_calls: total_llm_calls,
+        retry_budget: retry_budget
+      },
       0,
       baseline_attempt_stats(0, 0)
     )
   end
 
-  defp baseline_burst_attempt(
-         field,
-         method,
-         client,
-         method_opts,
-         input,
-         index,
-         total,
-         total_llm_calls,
-         retry_budget,
-         attempt,
-         stats
-       ) do
+  defp baseline_burst_attempt(ctx, attempt, stats) do
     prompt =
-      field
-      |> Prompt.baseline_prompt(method, method_opts)
+      ctx.field
+      |> Prompt.baseline_prompt(ctx.method, ctx.method_opts)
       |> maybe_strengthen_baseline_prompt(attempt)
 
-    Progress.event(method_opts, :baseline_call_start, %{
-      index: index,
-      llm_index: baseline_llm_index(method_opts, index),
-      llm_total: total_llm_calls,
-      total: total,
-      method: method_label(method),
-      input_preview: input
+    Progress.event(ctx.method_opts, :baseline_call_start, %{
+      index: ctx.index,
+      llm_index: baseline_llm_index(ctx.method_opts, ctx.index),
+      llm_total: ctx.total_llm_calls,
+      total: ctx.total,
+      method: method_label(ctx.method),
+      input_preview: ctx.input
     })
 
-    case client.complete(prompt, baseline_completion_opts(prompt, input, method_opts)) do
+    case ctx.client.complete(prompt, baseline_completion_opts(prompt, ctx.input, ctx.method_opts)) do
       {:ok, raw} ->
-        case build_baseline_burst(field, method, raw) do
+        case build_baseline_burst(ctx.field, ctx.method, raw) do
           {:ok, burst} ->
-            Progress.event(method_opts, :baseline_call_done, %{
-              index: index,
-              llm_index: baseline_llm_index(method_opts, index),
-              llm_total: total_llm_calls,
-              method: method_label(method),
-              total: total,
+            Progress.event(ctx.method_opts, :baseline_call_done, %{
+              index: ctx.index,
+              llm_index: baseline_llm_index(ctx.method_opts, ctx.index),
+              llm_total: ctx.total_llm_calls,
+              method: method_label(ctx.method),
+              total: ctx.total,
               answer_length: String.length(burst.answer),
               output_preview: burst.answer
             })
@@ -2082,30 +2072,16 @@ defmodule AntiAgents.Frontier do
             {burst, stats}
 
           {:error, reason, preview} ->
-            retry_or_reject_baseline(
-              field,
-              method,
-              client,
-              method_opts,
-              input,
-              index,
-              total,
-              total_llm_calls,
-              retry_budget,
-              attempt,
-              stats,
-              reason,
-              preview
-            )
+            retry_or_reject_baseline(ctx, attempt, stats, reason, preview)
         end
 
       {:error, reason} ->
-        Progress.event(method_opts, :baseline_call_error, %{
-          index: index,
-          llm_index: baseline_llm_index(method_opts, index),
-          llm_total: total_llm_calls,
-          method: method_label(method),
-          total: total,
+        Progress.event(ctx.method_opts, :baseline_call_error, %{
+          index: ctx.index,
+          llm_index: baseline_llm_index(ctx.method_opts, ctx.index),
+          llm_total: ctx.total_llm_calls,
+          method: method_label(ctx.method),
+          total: ctx.total,
           reason: inspect(reason)
         })
 
@@ -2115,56 +2091,34 @@ defmodule AntiAgents.Frontier do
 
   defp baseline_llm_index(opts, index), do: Keyword.get(opts, :progress_llm_offset, 0) + index
 
-  defp retry_or_reject_baseline(
-         field,
-         method,
-         client,
-         method_opts,
-         input,
-         index,
-         total,
-         total_llm_calls,
-         retry_budget,
-         attempt,
-         stats,
-         reason,
-         preview
-       ) do
-    if attempt < retry_budget do
+  defp retry_or_reject_baseline(ctx, attempt, stats, reason, preview) do
+    if attempt < ctx.retry_budget do
       retry_count = attempt + 1
 
-      Progress.event(method_opts, :baseline_call_retry, %{
-        index: index,
-        llm_index: baseline_llm_index(method_opts, index),
-        llm_total: total_llm_calls,
-        method: method_label(method),
-        total: total,
+      Progress.event(ctx.method_opts, :baseline_call_retry, %{
+        index: ctx.index,
+        llm_index: baseline_llm_index(ctx.method_opts, ctx.index),
+        llm_total: ctx.total_llm_calls,
+        method: method_label(ctx.method),
+        total: ctx.total,
         attempt: retry_count,
-        retry_budget: retry_budget,
+        retry_budget: ctx.retry_budget,
         reason: inspect(reason),
         output_preview: preview
       })
 
       baseline_burst_attempt(
-        field,
-        method,
-        client,
-        method_opts,
-        input,
-        index,
-        total,
-        total_llm_calls,
-        retry_budget,
+        ctx,
         retry_count,
         Map.update!(stats, :retry_count, &(&1 + 1))
       )
     else
-      Progress.event(method_opts, :baseline_call_rejected, %{
-        index: index,
-        llm_index: baseline_llm_index(method_opts, index),
-        llm_total: total_llm_calls,
-        method: method_label(method),
-        total: total,
+      Progress.event(ctx.method_opts, :baseline_call_rejected, %{
+        index: ctx.index,
+        llm_index: baseline_llm_index(ctx.method_opts, ctx.index),
+        llm_total: ctx.total_llm_calls,
+        method: method_label(ctx.method),
+        total: ctx.total,
         reason: inspect(reason),
         output_preview: preview
       })

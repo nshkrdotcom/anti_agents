@@ -10,6 +10,7 @@ defmodule AntiAgents.MixProject do
       deps: deps(),
       aliases: aliases(),
       preferred_cli_env: preferred_cli_env(),
+      test_coverage: [summary: [threshold: 80]],
       docs: docs(),
       package: package(),
       dialyzer: dialyzer()

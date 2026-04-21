@@ -16,21 +16,21 @@ Field
   -> trace JSON
 ```
 
-## Modules
+## Components
 
-- `AntiAgents.Field`: normalized field prompt, axes, and steering text.
-- `AntiAgents.Prompt`: SSoT burst contract and clean baseline prompt contract.
-- `AntiAgents.Bursts`: parallel burst execution through `Task.async_stream`.
-- `AntiAgents.Frontier`: reachable archive construction, frontier filtering,
+- Field value object: normalized field prompt, axes, and steering text.
+- Prompt builder: SSoT burst contract and clean baseline prompt contract.
+- Burst runner: parallel burst execution through `Task.async_stream`.
+- Frontier assembler: reachable archive construction, frontier filtering,
   matched-budget comparison, archive-feedback rounds, and report assembly.
-- `AntiAgents.Scoring`: mapping verification, descriptor cells, coherence,
+- Scoring layer: mapping verification, descriptor cells, coherence,
   scoring weights, and fallback lexical similarity.
-- `AntiAgents.Distance`: pluggable similarity backend behavior.
-- `AntiAgents.Statistics`: distinct-cell counts and bootstrap confidence
+- Distance layer: pluggable similarity backend behavior.
+- Statistics layer: distinct-cell counts and bootstrap confidence
   intervals.
-- `AntiAgents.Trace`: JSON evidence report.
-- `Mix.Tasks.AntiAgents.Frontier`: single-field CLI.
-- `Mix.Tasks.AntiAgents.Benchmark`: multi-field matched-budget benchmark CLI.
+- Trace writer: JSON evidence report.
+- Frontier Mix task: single-field CLI.
+- Benchmark Mix task: multi-field matched-budget benchmark CLI.
 
 ## Boundary
 

@@ -151,11 +151,17 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
           "repetitions" => config.repetitions,
           "planned_llm_calls" => planned_llm_calls,
           "evidence" => %{"hypothesis_test" => hypothesis},
-          "runs" => Enum.map(reports, & &1.trace)
+          "runs" => Enum.map(reports, &benchmark_run_trace/1)
         },
         config
       )
     end
+  end
+
+  defp benchmark_run_trace(%{field_id: field_id, repetition: repetition, trace: trace}) do
+    trace
+    |> Map.put("field_id", field_id)
+    |> Map.put("repetition", repetition)
   end
 
   defp run_reports(fields, config, progress_opts, calls_per_run, planned_llm_calls) do
@@ -166,94 +172,83 @@ defmodule Mix.Tasks.AntiAgents.Benchmark do
     |> Enum.with_index(1)
     |> Enum.flat_map(fn {field_map, field_index} ->
       for repetition <- 1..config.repetitions do
-        run_one_report(
-          field_map,
-          field_index,
-          field_count,
-          repetition,
-          run_total,
-          config,
-          progress_opts,
-          calls_per_run,
-          planned_llm_calls
-        )
+        run_one_report(field_map, %{
+          field_index: field_index,
+          field_count: field_count,
+          repetition: repetition,
+          run_total: run_total,
+          config: config,
+          progress_opts: progress_opts,
+          calls_per_run: calls_per_run,
+          planned_llm_calls: planned_llm_calls
+        })
       end
     end)
   end
 
-  defp run_one_report(
-         field_map,
-         field_index,
-         field_count,
-         repetition,
-         run_total,
-         config,
-         progress_opts,
-         calls_per_run,
-         planned_llm_calls
-       ) do
+  defp run_one_report(field_map, ctx) do
     field = field_from_map(field_map)
-    run_index = (repetition - 1) * field_count + field_index
+    run_index = (ctx.repetition - 1) * ctx.field_count + ctx.field_index
     field_id = Map.get(field_map, "id", field.prompt)
-    llm_offset = (run_index - 1) * calls_per_run
+    llm_offset = (run_index - 1) * ctx.calls_per_run
 
     benchmark_opts = [
       benchmark_run_index: run_index,
-      benchmark_run_total: run_total,
-      benchmark_field_index: field_index,
-      benchmark_field_total: field_count,
+      benchmark_run_total: ctx.run_total,
+      benchmark_field_index: ctx.field_index,
+      benchmark_field_total: ctx.field_count,
       benchmark_field_id: field_id,
       benchmark_llm_offset: llm_offset,
-      benchmark_llm_total: planned_llm_calls
+      benchmark_llm_total: ctx.planned_llm_calls
     ]
 
-    AntiAgents.Progress.event(progress_opts, :benchmark_run_start, %{
+    AntiAgents.Progress.event(ctx.progress_opts, :benchmark_run_start, %{
       run_index: run_index,
-      run_total: run_total,
-      field_index: field_index,
-      field_total: field_count,
+      run_total: ctx.run_total,
+      field_index: ctx.field_index,
+      field_total: ctx.field_count,
       field_id: field_id,
-      repetition: repetition,
-      repetitions: config.repetitions,
+      repetition: ctx.repetition,
+      repetitions: ctx.config.repetitions,
       llm_done: llm_offset,
-      llm_total: planned_llm_calls,
-      calls_this_run: calls_per_run
+      llm_total: ctx.planned_llm_calls,
+      calls_this_run: ctx.calls_per_run
     })
 
     opts =
       [
-        branching: config.branching,
-        baseline: config.baseline,
+        branching: ctx.config.branching,
+        baseline: ctx.config.baseline,
         matched_budget: true,
-        bootstrap_resamples: config.bootstrap_resamples,
-        baseline_retry_budget: config.baseline_retry_budget,
-        concurrency: config.concurrency,
-        rounds: config.rounds,
-        distance: parse_distance(config.distance),
-        timeout_ms: config.timeout_ms,
-        preview_chars: config.preview_chars,
-        model: config.model,
-        reasoning_effort: config.reasoning_effort,
-        verbose: config.verbose,
-        progress_state: Keyword.get(progress_opts, :progress_state),
-        heat: [answer: config.temperature]
+        bootstrap_resamples: ctx.config.bootstrap_resamples,
+        baseline_retry_budget: ctx.config.baseline_retry_budget,
+        concurrency: ctx.config.concurrency,
+        rounds: ctx.config.rounds,
+        distance: parse_distance(ctx.config.distance),
+        timeout_ms: ctx.config.timeout_ms,
+        preview_chars: ctx.config.preview_chars,
+        model: ctx.config.model,
+        reasoning_effort: ctx.config.reasoning_effort,
+        verbose: ctx.config.verbose,
+        progress_state: Keyword.get(ctx.progress_opts, :progress_state),
+        heat: [answer: ctx.config.temperature]
       ] ++ benchmark_opts
 
     report = AntiAgents.frontier(field, opts)
 
-    AntiAgents.Progress.event(progress_opts, :benchmark_run_done, %{
+    AntiAgents.Progress.event(ctx.progress_opts, :benchmark_run_done, %{
       run_index: run_index,
-      run_total: run_total,
+      run_total: ctx.run_total,
       field_id: field_id,
-      llm_done: llm_offset + calls_per_run,
-      llm_total: planned_llm_calls,
+      llm_done: llm_offset + ctx.calls_per_run,
+      llm_total: ctx.planned_llm_calls,
       accepted: length(report.exemplars),
       adjusted_novel_frontier_cell_count: report.adjusted_novel_frontier_cell_count
     })
 
     %{
       field_id: field_id,
-      repetition: repetition,
+      repetition: ctx.repetition,
       report: report,
       trace: AntiAgents.Trace.report(report, opts)
     }

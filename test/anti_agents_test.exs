@@ -4,7 +4,7 @@ defmodule AntiAgentsTest do
   import ExUnit.CaptureIO
 
   alias AntiAgents.{BurstResult, Field, FrontierReport}
-  alias AntiAgents.{Bursts, Progress, Scoring, Statistics}
+  alias AntiAgents.{Bursts, Distance, Progress, Scoring, Statistics}
   alias Mix.Tasks.AntiAgents.Benchmark, as: BenchmarkTask
   alias Mix.Tasks.AntiAgents.Frontier, as: FrontierTask
 
@@ -514,25 +514,23 @@ defmodule AntiAgentsTest do
 
   describe "compare/2 and frontier/2" do
     test "distance backends expose jaccard, embedding, and judge paths" do
-      assert AntiAgents.Distance.Jaccard.pairwise("the cat sat", "the cat sat", []) ==
+      assert Distance.Jaccard.pairwise("the cat sat", "the cat sat", []) ==
                {:ok, 1.0}
 
       assert {:ok, similarity} =
-               AntiAgents.Distance.Embedding.pairwise("cat", "cat again",
+               Distance.Embedding.pairwise("cat", "cat again",
                  embedding_client: StubEmbeddingClient
                )
 
       assert similarity > 0.99
 
       assert {:ok, different} =
-               AntiAgents.Distance.Embedding.pairwise("cat", "ocean",
-                 embedding_client: StubEmbeddingClient
-               )
+               Distance.Embedding.pairwise("cat", "ocean", embedding_client: StubEmbeddingClient)
 
       assert different < 0.1
 
       assert {:error, :judge_backend_not_configured} =
-               AntiAgents.Distance.Judge.pairwise("a", "b", [])
+               Distance.Judge.pairwise("a", "b", [])
     end
 
     test "fit_centroids is idempotent when k covers unique inputs" do

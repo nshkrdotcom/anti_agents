@@ -257,6 +257,35 @@ The live benchmark report writes `evidence.hypothesis_test.rejects_null` as a
 boolean. A `false` value is a valid empirical result and should be reported, not
 suppressed.
 
+A 12-field smoke benchmark was run with one plain baseline, one frontier burst,
+one matched-baseline continuation, and 200 bootstrap resamples per run:
+
+```json
+{
+  "field_count": 12,
+  "repetitions": 1,
+  "planned_llm_calls": 36,
+  "accepted_frontier_runs": 3,
+  "adjusted_novel_frontier_cell_total": 3,
+  "baseline_retry_total": 3,
+  "baseline_permanent_loss_total": 0,
+  "hypothesis_test": {
+    "frontier_cell_count": 2,
+    "matched_baseline_cell_count": 2,
+    "delta_distinct_cells": 0,
+    "bootstrap_ci_95": [-1.0, 1.0],
+    "rejects_null": false,
+    "n_resamples": 200
+  }
+}
+```
+
+Interpretation. The benchmark plumbing worked and produced an auditable trace,
+but this small smoke run does **not** support the positive research hypothesis:
+the aggregate frontier did not exceed the matched baseline in distinct-cell
+count. That is expected for a deliberately tiny `branching: 1` smoke test; the
+result is useful as a harness check, not as evidence of frontier advantage.
+
 For live benchmark runs, use verbose mode when collecting evidence:
 
 ```bash
