@@ -4,8 +4,11 @@ defmodule AntiAgents.CLI do
   @switches [
     dry_run: :boolean,
     include_raw: :boolean,
+    verbose: :boolean,
     branching: :integer,
     concurrency: :integer,
+    heartbeat_ms: :integer,
+    preview_chars: :integer,
     timeout_ms: :integer,
     temperature: :float,
     seed_temperature: :float,
@@ -57,6 +60,9 @@ defmodule AntiAgents.CLI do
       --reasoning EFFORT      default low
       --baseline LIST         plain,paraphrase,seed_injection,temp:0.8|1.0|1.2
       --out PATH              write JSON trace to PATH
+      --verbose               emit step-by-step progress and heartbeat logs
+      --heartbeat-ms N        verbose heartbeat interval, default 5000
+      --preview-chars N       chars shown from prompt/output previews, default 180
       --dry-run               print run config without calling Codex
     """
   end
@@ -67,6 +73,7 @@ defmodule AntiAgents.CLI do
     [
       dry_run: Keyword.get(opts, :dry_run, false),
       include_raw: Keyword.get(opts, :include_raw, false),
+      verbose: Keyword.get(opts, :verbose, false),
       out: Keyword.get(opts, :out),
       field: [
         toward: Keyword.get_values(opts, :toward),
@@ -74,6 +81,8 @@ defmodule AntiAgents.CLI do
       ],
       branching: Keyword.get(opts, :branching, 8),
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
+      heartbeat_ms: Keyword.get(opts, :heartbeat_ms, 5_000),
+      preview_chars: Keyword.get(opts, :preview_chars, 180),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       model: Keyword.get(opts, :model, AntiAgents.CodexConfig.default_model()),
       reasoning_effort:

@@ -1,0 +1,370 @@
+defmodule AntiAgents.Progress do
+  @moduledoc false
+
+  @default_preview_chars 180
+
+  def enabled?(opts) do
+    Keyword.get(opts, :verbose, false) or Keyword.has_key?(opts, :progress_callback)
+  end
+
+  def preview(value, limit \\ @default_preview_chars)
+
+  def preview(nil, _limit), do: ""
+
+  def preview(value, limit) when is_binary(value) do
+    value
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> truncate(limit)
+  end
+
+  def preview(value, limit), do: value |> inspect() |> preview(limit)
+
+  def event(opts, event, metadata \\ %{}) do
+    metadata = metadata_map(metadata)
+
+    opts
+    |> Keyword.get(:progress_callback)
+    |> call_callback(event, metadata)
+
+    snapshot = update_state(opts, event, metadata)
+
+    if Keyword.get(opts, :verbose, false) do
+      IO.puts(:stderr, format(event, metadata, snapshot, opts))
+    end
+
+    :ok
+  end
+
+  def with_heartbeat(opts, label, fun) when is_function(fun, 0) or is_function(fun, 1) do
+    if enabled?(opts) do
+      interval = Keyword.get(opts, :heartbeat_ms, 5_000)
+      started_at = System.monotonic_time(:millisecond)
+      {:ok, state} = Agent.start_link(fn -> initial_state(label, started_at) end)
+      opts = Keyword.put(opts, :progress_state, state)
+      pid = spawn_link(fn -> heartbeat_loop(opts, label, interval, started_at, 1) end)
+
+      try do
+        call_fun(fun, opts)
+      after
+        send(pid, :stop)
+        Process.unlink(pid)
+        Agent.stop(state)
+      end
+    else
+      call_fun(fun, opts)
+    end
+  end
+
+  defp call_fun(fun, _opts) when is_function(fun, 0), do: fun.()
+  defp call_fun(fun, opts) when is_function(fun, 1), do: fun.(opts)
+
+  defp heartbeat_loop(opts, label, interval, started_at, tick) do
+    receive do
+      :stop ->
+        :ok
+    after
+      max(10, interval) ->
+        elapsed_ms = System.monotonic_time(:millisecond) - started_at
+        event(opts, :heartbeat, %{label: label, elapsed_ms: elapsed_ms, tick: tick})
+        heartbeat_loop(opts, label, interval, started_at, tick + 1)
+    end
+  end
+
+  defp initial_state(label, started_at) do
+    %{
+      label: label,
+      started_at: started_at,
+      stage: :starting,
+      stage_detail: "starting",
+      llm_done: 0,
+      llm_total: nil,
+      baseline_done: 0,
+      baseline_total: nil,
+      burst_done: 0,
+      burst_total: nil,
+      inflight: %{},
+      last_duration_ms: nil,
+      last_event: nil
+    }
+  end
+
+  defp update_state(opts, event, metadata) do
+    case Keyword.get(opts, :progress_state) do
+      nil ->
+        nil
+
+      state ->
+        Agent.get_and_update(state, fn snapshot ->
+          updated = reduce_state(snapshot, event, metadata)
+          {updated, updated}
+        end)
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp reduce_state(state, event, metadata) do
+    state
+    |> apply_event(event, metadata)
+    |> Map.put(:last_event, event)
+  end
+
+  defp apply_event(state, :run_plan, metadata) do
+    %{
+      state
+      | stage: :planned,
+        stage_detail: "plan announced",
+        llm_total: metadata[:total_llm_calls],
+        baseline_total: metadata[:baseline_calls],
+        burst_total: metadata[:frontier_bursts]
+    }
+  end
+
+  defp apply_event(state, :baseline_start, metadata) do
+    %{
+      state
+      | stage: :baseline,
+        stage_detail: "building reachable archive",
+        baseline_total: metadata[:methods] || state.baseline_total
+    }
+  end
+
+  defp apply_event(state, :frontier_start, metadata) do
+    %{
+      state
+      | stage: :frontier,
+        stage_detail: "running SSoT frontier bursts",
+        burst_total: metadata[:branching] || state.burst_total
+    }
+  end
+
+  defp apply_event(state, :baseline_call_start, metadata),
+    do:
+      put_inflight(
+        state,
+        {:baseline, metadata[:index]},
+        "baseline #{metadata[:index]}/#{metadata[:total]}"
+      )
+
+  defp apply_event(state, :burst_call_start, metadata),
+    do:
+      put_inflight(
+        state,
+        {:burst, metadata[:index]},
+        "burst #{metadata[:index]}/#{metadata[:total]}"
+      )
+
+  defp apply_event(state, :baseline_call_done, metadata) do
+    state
+    |> finish_inflight({:baseline, metadata[:index]})
+    |> Map.update!(:baseline_done, &(&1 + 1))
+    |> Map.update!(:llm_done, &(&1 + 1))
+  end
+
+  defp apply_event(state, :baseline_call_error, metadata) do
+    state
+    |> finish_inflight({:baseline, metadata[:index]})
+    |> Map.update!(:baseline_done, &(&1 + 1))
+    |> Map.update!(:llm_done, &(&1 + 1))
+  end
+
+  defp apply_event(state, :burst_call_done, metadata) do
+    state
+    |> finish_inflight({:burst, metadata[:index]})
+    |> Map.update!(:burst_done, &(&1 + 1))
+    |> Map.update!(:llm_done, &(&1 + 1))
+  end
+
+  defp apply_event(state, :burst_call_error, metadata) do
+    state
+    |> finish_inflight({:burst, metadata[:index]})
+    |> Map.update!(:burst_done, &(&1 + 1))
+    |> Map.update!(:llm_done, &(&1 + 1))
+  end
+
+  defp apply_event(state, :frontier_report_done, _metadata),
+    do: %{state | stage: :reporting, stage_detail: "scoring archive"}
+
+  defp apply_event(state, :trace_written, _metadata),
+    do: %{state | stage: :done, stage_detail: "trace written"}
+
+  defp apply_event(state, :mix_frontier_done, _metadata),
+    do: %{state | stage: :done, stage_detail: "done"}
+
+  defp apply_event(state, _event, _metadata), do: state
+
+  defp put_inflight(state, key, label) do
+    started_at = System.monotonic_time(:millisecond)
+    inflight = Map.put(state.inflight, key, %{label: label, started_at: started_at})
+    %{state | inflight: inflight, last_duration_ms: nil}
+  end
+
+  defp finish_inflight(state, key) do
+    {entry, inflight} = Map.pop(state.inflight, key)
+    duration = if entry, do: System.monotonic_time(:millisecond) - entry.started_at
+
+    %{state | inflight: inflight, last_duration_ms: duration}
+  end
+
+  defp call_callback(nil, _event, _metadata), do: :ok
+
+  defp call_callback(callback, event, metadata) when is_function(callback, 2) do
+    callback.(event, metadata)
+    :ok
+  rescue
+    _error -> :ok
+  end
+
+  defp call_callback(_callback, _event, _metadata), do: :ok
+
+  defp format(event, metadata, snapshot, opts) do
+    now = DateTime.utc_now() |> Calendar.strftime("%H:%M:%S")
+    "[anti_agents] #{now} #{message(event, metadata, snapshot, opts)}"
+  end
+
+  defp message(:mix_frontier_start, metadata, _snapshot, _opts) do
+    "Starting frontier run | field=#{inspect(preview(metadata[:field], 100))} | model=#{metadata[:model]} | reasoning=#{metadata[:reasoning_effort]} | dry_run=#{metadata[:dry_run]}"
+  end
+
+  defp message(:run_plan, metadata, _snapshot, _opts) do
+    "Plan: #{metadata[:total_llm_calls]} LLM calls = #{metadata[:baseline_calls]} baseline + #{metadata[:frontier_bursts]} frontier bursts, concurrency=#{metadata[:concurrency]}. Baseline maps what ordinary prompting can reach; frontier keeps SSoT bursts that land outside that map."
+  end
+
+  defp message(:compare_start, metadata, _snapshot, _opts) do
+    "Preparing comparison | baseline_methods=#{metadata[:baseline_methods]} | frontier_bursts=#{metadata[:branching]}"
+  end
+
+  defp message(:baseline_start, metadata, _snapshot, _opts) do
+    "Stage 1/3 baseline reachable archive: #{metadata[:methods]} calls. Why: define cells that plain/paraphrase/temperature already reach."
+  end
+
+  defp message(:baseline_call_start, metadata, _snapshot, opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} started | #{method_reason(metadata[:method])} | input=#{inspect(preview(metadata[:input_preview], preview_limit(opts)))}"
+  end
+
+  defp message(:baseline_call_done, metadata, snapshot, opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} done in #{duration(snapshot)} | output_chars=#{metadata[:answer_length]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
+  end
+
+  defp message(:baseline_call_error, metadata, snapshot, _opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
+  end
+
+  defp message(:baseline_done, metadata, _snapshot, _opts) do
+    "Baseline archive complete | accepted=#{metadata[:accepted]}. Next: run frontier bursts against this reachable map."
+  end
+
+  defp message(:frontier_start, metadata, _snapshot, _opts) do
+    "Stage 2/3 frontier exploration: #{metadata[:branching]} SSoT bursts. Why: internal random string -> local mapping -> answer, then reject collapse/reachable duplicates."
+  end
+
+  defp message(:branch_start, metadata, _snapshot, _opts) do
+    "Launching frontier burst batch | bursts=#{metadata[:count]} | concurrency=#{metadata[:concurrency]} | timeout_ms=#{metadata[:timeout_ms]}"
+  end
+
+  defp message(:burst_call_start, metadata, _snapshot, opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} burst #{metadata[:index]}/#{metadata[:total]} started | model=#{metadata[:model]} temp=#{metadata[:temperature]} | asks for random_string + mapping JSON + answer | input=#{inspect(preview(metadata[:input_preview], preview_limit(opts)))}"
+  end
+
+  defp message(:burst_call_done, metadata, snapshot, opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} burst #{metadata[:index]}/#{metadata[:total]} #{metadata[:status]} in #{duration(snapshot)} | seed_coverage=#{metadata[:seed_coverage]} | answer_chars=#{metadata[:answer_length]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
+  end
+
+  defp message(:burst_call_error, metadata, snapshot, _opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} burst #{metadata[:index]}/#{metadata[:total]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
+  end
+
+  defp message(:branch_done, metadata, _snapshot, _opts) do
+    "Frontier burst batch complete | total=#{metadata[:count]} | accepted=#{metadata[:accepted]} | rejected=#{metadata[:rejected]} | errors=#{metadata[:errors]}"
+  end
+
+  defp message(:frontier_done, metadata, _snapshot, _opts) do
+    "Frontier raw archive complete | total=#{metadata[:total]} | accepted=#{metadata[:accepted]} | rejected=#{metadata[:rejected]}. Next: score novelty against baseline."
+  end
+
+  defp message(:frontier_report_done, metadata, _snapshot, _opts) do
+    "Stage 3/3 report complete | accepted=#{metadata[:accepted]} | rejected=#{metadata[:rejected]} | delta_frontier=#{metadata[:delta_frontier]} | archive_coverage=#{metadata[:archive_coverage]} | mean_seed_coverage=#{metadata[:seed_coverage]}"
+  end
+
+  defp message(:trace_written, metadata, _snapshot, _opts) do
+    "Trace written: #{metadata[:path]}"
+  end
+
+  defp message(:mix_frontier_done, _metadata, _snapshot, _opts), do: "Run complete."
+
+  defp message(:heartbeat, metadata, snapshot, _opts) do
+    "Still running after #{seconds(metadata[:elapsed_ms])}s | #{progress_summary(snapshot)} | inflight=#{inflight_summary(snapshot)}"
+  end
+
+  defp message(event, metadata, _snapshot, _opts) do
+    "#{event} #{inspect(metadata)}"
+  end
+
+  defp method_reason("plain"), do: "ordinary prompt baseline"
+  defp method_reason("paraphrase"), do: "paraphrase baseline"
+  defp method_reason("seed_injection"), do: "external seed-injection baseline"
+  defp method_reason("temperature:" <> temp), do: "temperature sweep baseline at #{temp}"
+  defp method_reason(_method), do: "baseline method"
+
+  defp duration(%{last_duration_ms: ms}) when is_integer(ms), do: "#{Float.round(ms / 1000, 1)}s"
+  defp duration(_snapshot), do: "?"
+
+  defp progress_summary(nil), do: "progress unavailable"
+
+  defp progress_summary(snapshot) do
+    llm =
+      case snapshot.llm_total do
+        total when is_integer(total) -> "LLM #{snapshot.llm_done}/#{total}"
+        _ -> "LLM ?"
+      end
+
+    baseline =
+      if snapshot.baseline_total do
+        "baseline #{snapshot.baseline_done}/#{snapshot.baseline_total}"
+      else
+        "baseline ?"
+      end
+
+    bursts =
+      if snapshot.burst_total do
+        "bursts #{snapshot.burst_done}/#{snapshot.burst_total}"
+      else
+        "bursts ?"
+      end
+
+    "stage=#{snapshot.stage_detail}; #{llm}; #{baseline}; #{bursts}"
+  end
+
+  defp inflight_summary(nil), do: "unknown"
+
+  defp inflight_summary(%{inflight: inflight}) when map_size(inflight) == 0, do: "none"
+
+  defp inflight_summary(%{inflight: inflight}) do
+    now = System.monotonic_time(:millisecond)
+
+    inflight
+    |> Map.values()
+    |> Enum.map(fn entry -> "#{entry.label} #{seconds(now - entry.started_at)}s" end)
+    |> Enum.join(", ")
+  end
+
+  defp preview_limit(opts), do: Keyword.get(opts, :preview_chars, @default_preview_chars)
+
+  defp seconds(ms) when is_integer(ms), do: Float.round(ms / 1000, 1)
+  defp seconds(_ms), do: "?"
+
+  defp metadata_map(metadata) when is_map(metadata), do: metadata
+  defp metadata_map(metadata) when is_list(metadata), do: Map.new(metadata)
+  defp metadata_map(_metadata), do: %{}
+
+  defp truncate(value, limit) do
+    limit = max(20, limit || @default_preview_chars)
+
+    if String.length(value) > limit do
+      String.slice(value, 0, limit - 3) <> "..."
+    else
+      value
+    end
+  end
+end

@@ -2,7 +2,7 @@ defmodule AntiAgentsTest do
   use ExUnit.Case, async: true
 
   alias AntiAgents.{BurstResult, Field, FrontierReport}
-  alias AntiAgents.{Bursts, Scoring}
+  alias AntiAgents.{Bursts, Progress, Scoring}
 
   defmodule FakeOptions do
     def new(opts) do
@@ -71,6 +71,31 @@ defmodule AntiAgentsTest do
     def complete(_prompt, _opts), do: {:ok, "A plain answer without structure."}
   end
 
+  defmodule ArtifactClient do
+    def complete(_prompt, _opts) do
+      nested_answer =
+        Jason.encode!(%{
+          "schema_version" => "1",
+          "mode" => "dry_run",
+          "run_config" => %{},
+          "exemplars" => []
+        })
+
+      {:ok,
+       Jason.encode!(%{
+         "random_string" => "artifact-seed",
+         "mapping" => %{
+           "decisions" => [
+             %{"axis" => "ontology", "chunk" => 0, "value" => "x"},
+             %{"axis" => "metaphor", "chunk" => 1, "value" => "y"},
+             %{"axis" => "closure", "chunk" => 2, "value" => "z"}
+           ]
+         },
+         "answer" => nested_answer
+       })}
+    end
+  end
+
   defmodule FrontierClient do
     def complete(prompt, _opts) do
       if String.contains?(prompt, "<random_string>") do
@@ -107,11 +132,13 @@ defmodule AntiAgentsTest do
   describe "burst/2" do
     test "returns explicit structured result and threads temperature through settings" do
       field = AntiAgents.field("the memory of a color that doesn't exist")
+      test_pid = self()
 
       burst =
         Bursts.burst(field,
           client: BurstClient,
           client_opts: [],
+          progress_callback: fn event, meta -> send(test_pid, {:progress, event, meta}) end,
           heat: [answer: 1.0],
           thinking_budget: 900,
           seed: "seed-value",
@@ -124,6 +151,8 @@ defmodule AntiAgentsTest do
       assert opts[:model] == "gpt-5.4-mini"
       assert opts[:reasoning_effort] == :low
       assert String.contains?(opts[:input], "Coordinate nonce: seed-value")
+      assert_receive {:progress, :burst_call_start, %{temperature: 1.0}}
+      assert_receive {:progress, :burst_call_done, %{status: :accepted}}
 
       assert %BurstResult{} = burst
       assert burst.status == :accepted
@@ -163,6 +192,21 @@ defmodule AntiAgentsTest do
       assert burst.answer == "A plain answer without structure."
       assert burst.rejection_reason =~ "unstructured"
       assert length(burst.mapping_trace["decisions"]) == length(field.axes)
+    end
+
+    test "rejects nested control payloads instead of accepting them as answers" do
+      field = AntiAgents.field("artifact guard", axes: [:ontology, :metaphor, :closure])
+
+      burst =
+        Bursts.burst(field,
+          client: ArtifactClient,
+          client_opts: [],
+          seed: "artifact-seed",
+          coordinate: [length: 12, chunk: 4]
+        )
+
+      assert burst.status == :rejected
+      assert burst.rejection_reason =~ "artifact answer"
     end
   end
 
@@ -301,6 +345,39 @@ defmodule AntiAgentsTest do
       assert parsed.mapping["decisions"] == [%{"axis" => "ontology", "chunk" => 0}]
       assert parsed.answer == "Only the final answer text."
     end
+
+    test "unwraps malformed nested JSON when answer is embedded under mapping" do
+      output =
+        Jason.encode!(%{
+          "random_string" => "outer",
+          "mapping" => %{"decisions" => []},
+          "answer" =>
+            Jason.encode!(%{
+              "random_string" => "inner",
+              "mapping" => %{
+                "decisions" => [%{"axis" => "ontology", "chunk" => 0}],
+                "answer" => "Only the embedded answer text."
+              }
+            })
+        })
+
+      assert {:ok, parsed} = Scoring.parse_burst_output(output)
+      assert parsed.random_string == "inner"
+      assert parsed.mapping["decisions"] == [%{"axis" => "ontology", "chunk" => 0}]
+      assert parsed.answer == "Only the embedded answer text."
+    end
+
+    test "detects anti-agents control JSON as an artifact answer" do
+      answer =
+        Jason.encode!(%{
+          "schema_version" => "1",
+          "mode" => "dry_run",
+          "mapping_traces" => []
+        })
+
+      assert Scoring.artifact_answer?(answer)
+      refute Scoring.artifact_answer?(~s({"ordinary":"json","payload":true}))
+    end
   end
 
   describe "CLI and trace" do
@@ -318,6 +395,9 @@ defmodule AntiAgentsTest do
                  "gpt-5.4-mini",
                  "--reasoning",
                  "low",
+                 "--verbose",
+                 "--heartbeat-ms",
+                 "250",
                  "--baseline",
                  "plain,paraphrase,temp:0.8|1.0",
                  "--toward",
@@ -328,6 +408,8 @@ defmodule AntiAgentsTest do
 
       assert prompt == "memory field"
       assert opts[:dry_run] == true
+      assert opts[:verbose] == true
+      assert opts[:heartbeat_ms] == 250
       assert opts[:branching] == 12
       assert opts[:model] == "gpt-5.4-mini"
       assert opts[:reasoning_effort] == :low
@@ -335,6 +417,26 @@ defmodule AntiAgentsTest do
       assert opts[:baseline] == [:plain, :paraphrase, {:temperature, [0.8, 1.0]}]
       assert opts[:field][:toward] == ["machine pastoral"]
       assert opts[:field][:away_from] == ["standard sci-fi"]
+    end
+
+    test "heartbeat progress can be observed during long live runs" do
+      test_pid = self()
+
+      result =
+        Progress.with_heartbeat(
+          [
+            heartbeat_ms: 10,
+            progress_callback: fn event, meta -> send(test_pid, {:progress, event, meta}) end
+          ],
+          :test_run,
+          fn ->
+            Process.sleep(25)
+            :ok
+          end
+        )
+
+      assert result == :ok
+      assert_receive {:progress, :heartbeat, %{label: :test_run, tick: 1}}
     end
 
     test "serializes a frontier report into traceable evidence" do

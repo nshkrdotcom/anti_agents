@@ -21,21 +21,32 @@ defmodule Mix.Tasks.AntiAgents.Frontier do
   end
 
   defp run_frontier(prompt, opts) do
-    if Keyword.get(opts, :dry_run, false) do
-      AntiAgents.Trace.dry_run(prompt, opts)
-      |> emit_trace(opts)
-    else
-      field = AntiAgents.field(prompt, Keyword.get(opts, :field, []))
+    AntiAgents.Progress.with_heartbeat(opts, :mix_frontier, fn opts ->
+      AntiAgents.Progress.event(opts, :mix_frontier_start, %{
+        dry_run: Keyword.get(opts, :dry_run, false),
+        field: prompt,
+        model: Keyword.get(opts, :model),
+        reasoning_effort: Keyword.get(opts, :reasoning_effort)
+      })
 
-      report =
-        opts
-        |> run_opts()
-        |> then(&AntiAgents.frontier(field, &1))
+      if Keyword.get(opts, :dry_run, false) do
+        AntiAgents.Trace.dry_run(prompt, opts)
+        |> emit_trace(opts)
+      else
+        field = AntiAgents.field(prompt, Keyword.get(opts, :field, []))
 
-      report
-      |> AntiAgents.Trace.report(opts)
-      |> emit_trace(opts)
-    end
+        report =
+          opts
+          |> run_opts()
+          |> then(&AntiAgents.frontier(field, &1))
+
+        report
+        |> AntiAgents.Trace.report(opts)
+        |> emit_trace(opts)
+      end
+
+      AntiAgents.Progress.event(opts, :mix_frontier_done)
+    end)
   end
 
   defp run_opts(opts) do
@@ -51,6 +62,7 @@ defmodule Mix.Tasks.AntiAgents.Frontier do
 
       path ->
         AntiAgents.Trace.write_json!(path, trace)
+        AntiAgents.Progress.event(opts, :trace_written, %{path: path})
         Mix.shell().info("Wrote AntiAgents trace to #{path}")
     end
   end

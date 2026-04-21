@@ -703,6 +703,14 @@ defmodule AntiAgents.Scoring do
     maximum_similarity(text, bursts) > threshold
   end
 
+  def artifact_answer?(answer) when is_binary(answer) do
+    answer
+    |> String.trim()
+    |> artifact_answer_text?()
+  end
+
+  def artifact_answer?(_answer), do: false
+
   def duplicate?(_candidate, []), do: false
   def duplicate?(candidate, bursts), do: near_duplicate?(candidate.answer, bursts)
 
@@ -801,6 +809,13 @@ defmodule AntiAgents.Scoring do
        %{"random_string" => nested_random, "mapping" => nested_mapping, "answer" => nested_answer}} ->
         normalize_parsed_json(nested_random, nested_mapping, nested_answer)
 
+      {:ok,
+       %{
+         "random_string" => nested_random,
+         "mapping" => %{"answer" => nested_answer} = nested_mapping
+       }} ->
+        normalize_parsed_json(nested_random, Map.delete(nested_mapping, "answer"), nested_answer)
+
       _other ->
         {:ok,
          %{
@@ -867,6 +882,67 @@ defmodule AntiAgents.Scoring do
   defp count_words(text), do: token_set(text) |> length()
   defp sentence_count(text), do: String.split(text, ~r/[.!?]+/, trim: true) |> length()
   defp token_set(text), do: String.downcase(text) |> String.split(~r/[^[:alnum:]]+/, trim: true)
+
+  defp artifact_answer_text?(""), do: false
+
+  defp artifact_answer_text?(text) do
+    String.contains?(text, "<random_string>") or
+      String.contains?(text, "<mapping>") or
+      control_json_payload?(text)
+  end
+
+  defp control_json_payload?(text) do
+    case Jason.decode(text) do
+      {:ok, decoded} ->
+        control_key_count(decoded) >= 2
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp control_key_count(value) when is_map(value) do
+    local =
+      value
+      |> Map.keys()
+      |> Enum.count(&(to_string(&1) in control_payload_keys()))
+
+    nested =
+      value
+      |> Map.values()
+      |> Enum.map(&control_key_count/1)
+      |> Enum.sum()
+
+    local + nested
+  end
+
+  defp control_key_count(value) when is_list(value) do
+    value
+    |> Enum.map(&control_key_count/1)
+    |> Enum.sum()
+  end
+
+  defp control_key_count(_value), do: 0
+
+  defp control_payload_keys do
+    ~w(
+      answer
+      anti_collapse
+      delta_frontier
+      exemplars
+      frontier_delta
+      mapping
+      mapping_trace
+      mapping_traces
+      mode
+      random_string
+      reachable_hits
+      rejected_duplicates
+      run_config
+      schema_version
+      synthesis
+    )
+  end
 
   defp semantic_fingerprint(text) do
     :crypto.hash(:sha256, String.downcase(text))
@@ -946,7 +1022,7 @@ end
 defmodule AntiAgents.Bursts do
   @moduledoc false
 
-  alias AntiAgents.{BurstResult, CodexClient, Field, Prompt, Scoring}
+  alias AntiAgents.{BurstResult, CodexClient, Field, Progress, Prompt, Scoring}
 
   @type burst_output :: BurstResult.t()
 
@@ -960,11 +1036,40 @@ defmodule AntiAgents.Bursts do
     prompt = Prompt.burst_prompt(field, options)
     input = Prompt.field_input(field, options)
 
+    Progress.event(options, :burst_call_start, %{
+      index: Keyword.get(options, :burst_index),
+      llm_index: progress_llm_index(options),
+      llm_total: Keyword.get(options, :progress_llm_total),
+      total: Keyword.get(options, :burst_total),
+      model: Keyword.get(options, :model),
+      temperature: Prompt.response_temperature(options),
+      input_preview: input
+    })
+
     case client.complete(prompt, completion_opts(field, prompt, input, options)) do
       {:ok, raw} ->
-        burst_from_raw(field, seed, chunk_size, raw)
+        burst = burst_from_raw(field, seed, chunk_size, raw)
+
+        Progress.event(options, :burst_call_done, %{
+          index: Keyword.get(options, :burst_index),
+          llm_index: progress_llm_index(options),
+          llm_total: Keyword.get(options, :progress_llm_total),
+          status: burst.status,
+          seed_coverage: burst.seed_coverage,
+          answer_length: String.length(burst.answer),
+          output_preview: burst.answer
+        })
+
+        burst
 
       {:error, reason} ->
+        Progress.event(options, :burst_call_error, %{
+          index: Keyword.get(options, :burst_index),
+          llm_index: progress_llm_index(options),
+          llm_total: Keyword.get(options, :progress_llm_total),
+          reason: inspect(reason)
+        })
+
         provider_error_burst(field, seed, reason)
     end
   end
@@ -976,8 +1081,20 @@ defmodule AntiAgents.Bursts do
     timeout = Keyword.get(options, :timeout_ms, 120_000)
     burst_opts = Keyword.delete(options, :seed)
 
+    Progress.event(options, :branch_start, %{
+      count: n,
+      concurrency: concurrency,
+      timeout_ms: timeout
+    })
+
     1..n
-    |> Task.async_stream(fn _ -> burst(field, burst_opts) end,
+    |> Task.async_stream(
+      fn index ->
+        burst_opts
+        |> Keyword.put(:burst_index, index)
+        |> Keyword.put(:burst_total, n)
+        |> then(&burst(field, &1))
+      end,
       max_concurrency: concurrency,
       timeout: timeout,
       ordered: true
@@ -997,6 +1114,14 @@ defmodule AntiAgents.Bursts do
           status: :provider_error,
           rejection_reason: inspect(reason)
         }
+    end)
+    |> tap(fn bursts ->
+      Progress.event(options, :branch_done, %{
+        count: length(bursts),
+        accepted: Enum.count(bursts, &(&1.status == :accepted)),
+        rejected: Enum.count(bursts, &(&1.status == :rejected)),
+        errors: Enum.count(bursts, &(&1.status in [:provider_error, :parse_error]))
+      })
     end)
   end
 
@@ -1064,10 +1189,19 @@ defmodule AntiAgents.Bursts do
   end
 
   defp maybe_reject_candidate(candidate, mapping, chunk_count) do
-    if Scoring.anti_collapse_fail?(mapping, chunk_count) do
-      %{candidate | status: :rejected, rejection_reason: "low seed coverage / chunk collapse"}
-    else
-      candidate
+    cond do
+      Scoring.artifact_answer?(candidate.answer) ->
+        %{
+          candidate
+          | status: :rejected,
+            rejection_reason: "artifact answer / nested control payload"
+        }
+
+      Scoring.anti_collapse_fail?(mapping, chunk_count) ->
+        %{candidate | status: :rejected, rejection_reason: "low seed coverage / chunk collapse"}
+
+      true ->
+        candidate
     end
   end
 
@@ -1098,7 +1232,21 @@ defmodule AntiAgents.Bursts do
       }
       |> Map.put(:seed_coverage, Scoring.seed_coverage(mapping, chunk_count))
 
-    Scoring.enrich(base, descriptor, base.seed_coverage)
+    base
+    |> Scoring.enrich(descriptor, base.seed_coverage)
+    |> maybe_reject_artifact_answer()
+  end
+
+  defp maybe_reject_artifact_answer(candidate) do
+    if Scoring.artifact_answer?(candidate.answer) do
+      %{
+        candidate
+        | status: :rejected,
+          rejection_reason: "artifact answer / nested control payload"
+      }
+    else
+      candidate
+    end
   end
 
   defp parse_error_burst(field, seed, reason) do
@@ -1159,6 +1307,15 @@ defmodule AntiAgents.Bursts do
 
   defp get_coordinate(opts, key, default), do: get_in(opts, [:coordinate, key]) || default
 
+  defp progress_llm_index(opts) do
+    offset = Keyword.get(opts, :progress_llm_offset, 0)
+
+    case Keyword.get(opts, :burst_index) do
+      index when is_integer(index) -> offset + index
+      other -> other
+    end
+  end
+
   defp chunk_count(seed, chunk_size) when is_integer(chunk_size) and chunk_size > 0 do
     seed
     |> String.length()
@@ -1174,7 +1331,7 @@ end
 defmodule AntiAgents.Frontier do
   @moduledoc false
 
-  alias AntiAgents.{BurstResult, Bursts, Field, FrontierReport, Prompt, Scoring}
+  alias AntiAgents.{BurstResult, Bursts, Field, FrontierReport, Progress, Prompt, Scoring}
 
   @type compare_output :: %{
           field: Field.t(),
@@ -1196,8 +1353,39 @@ defmodule AntiAgents.Frontier do
         :seed_injection
       ])
 
-    reachable = baseline_bursts(field, baseline_opts, opts)
-    frontier_bursts = Bursts.branch(field, branch_count, opts)
+    baseline_count = baseline_method_count(baseline_opts)
+    total_llm_calls = baseline_count + branch_count
+
+    Progress.event(opts, :run_plan, %{
+      baseline_calls: baseline_count,
+      frontier_bursts: branch_count,
+      total_llm_calls: total_llm_calls,
+      concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
+    })
+
+    Progress.event(opts, :compare_start, %{
+      branching: branch_count,
+      baseline_methods: baseline_count
+    })
+
+    Progress.event(opts, :baseline_start, %{methods: baseline_count})
+    reachable = baseline_bursts(field, baseline_opts, opts, total_llm_calls)
+
+    Progress.event(opts, :baseline_done, %{accepted: length(reachable)})
+    Progress.event(opts, :frontier_start, %{branching: branch_count})
+
+    frontier_opts =
+      opts
+      |> Keyword.put(:progress_llm_offset, baseline_count)
+      |> Keyword.put(:progress_llm_total, total_llm_calls)
+
+    frontier_bursts = Bursts.branch(field, branch_count, frontier_opts)
+
+    Progress.event(opts, :frontier_done, %{
+      total: length(frontier_bursts),
+      accepted: Enum.count(frontier_bursts, &(&1.status == :accepted)),
+      rejected: Enum.count(frontier_bursts, &(&1.status == :rejected))
+    })
 
     %{
       field: field,
@@ -1230,7 +1418,7 @@ defmodule AntiAgents.Frontier do
 
     delta = length(frontier_cells) - reachable_cell_count
 
-    %FrontierReport{
+    frontier_report = %FrontierReport{
       field: field,
       exemplars: accepted,
       delta_frontier: Float.round(delta * 1.0, 3),
@@ -1244,12 +1432,28 @@ defmodule AntiAgents.Frontier do
         archive_coverage: if(archive_size == 0, do: 0.0, else: length(accepted) / archive_size)
       }
     }
+
+    Progress.event(opts, :frontier_report_done, %{
+      accepted: length(frontier_report.exemplars),
+      rejected: length(frontier_report.rejected_duplicates),
+      delta_frontier: frontier_report.delta_frontier,
+      archive_coverage: frontier_report.metrics.archive_coverage,
+      seed_coverage: frontier_report.metrics.seed_coverage
+    })
+
+    frontier_report
   end
 
-  defp baseline_bursts(field, methods, opts) do
+  defp baseline_bursts(field, methods, opts, total_llm_calls) do
     methods
     |> Enum.flat_map(&expand_method/1)
-    |> Enum.map(&baseline_burst(field, &1, opts))
+    |> then(fn expanded ->
+      expanded
+      |> Enum.with_index(1)
+      |> Enum.map(fn {method, index} ->
+        baseline_burst(field, method, opts, index, length(expanded), total_llm_calls)
+      end)
+    end)
     |> Enum.reject(&is_nil/1)
   end
 
@@ -1262,20 +1466,59 @@ defmodule AntiAgents.Frontier do
 
   defp expand_method(_), do: []
 
-  defp baseline_burst(field, method, opts) do
+  defp baseline_burst(field, method, opts, index, total, total_llm_calls) do
     client = Keyword.get(opts, :client, AntiAgents.CodexClient)
     method_opts = baseline_method_opts(method, opts)
     prompt = Prompt.baseline_prompt(field, method, method_opts)
     input = Prompt.field_input(field, method_opts)
 
+    Progress.event(opts, :baseline_call_start, %{
+      index: index,
+      llm_index: index,
+      llm_total: total_llm_calls,
+      total: total,
+      method: method_label(method),
+      input_preview: input
+    })
+
     case client.complete(prompt, completion_opts(field, prompt, input, method_opts)) do
       {:ok, raw} ->
-        build_baseline_burst(field, method, raw)
+        burst = build_baseline_burst(field, method, raw)
 
-      {:error, _reason} ->
+        Progress.event(opts, :baseline_call_done, %{
+          index: index,
+          llm_index: index,
+          llm_total: total_llm_calls,
+          method: method_label(method),
+          total: total,
+          answer_length: String.length(burst.answer),
+          output_preview: burst.answer
+        })
+
+        burst
+
+      {:error, reason} ->
+        Progress.event(opts, :baseline_call_error, %{
+          index: index,
+          llm_index: index,
+          llm_total: total_llm_calls,
+          method: method_label(method),
+          total: total,
+          reason: inspect(reason)
+        })
+
         nil
     end
   end
+
+  defp baseline_method_count(methods) do
+    methods
+    |> Enum.flat_map(&expand_method/1)
+    |> length()
+  end
+
+  defp method_label({:temperature, temp}), do: "temperature:#{temp}"
+  defp method_label(method), do: to_string(method)
 
   defp baseline_method_opts({:temperature, temp}, opts) when is_number(temp) do
     Keyword.put(opts, :model_settings, model_settings_with_temperature(opts, temp))
