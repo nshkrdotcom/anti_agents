@@ -1,0 +1,90 @@
+<svg width="200" height="200" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">AntiAgents</title>
+  <desc id="desc">A hexagonal emblem with mirrored agent flows and a luminous central kernel.</desc>
+  <defs>
+    <linearGradient id="shell" x1="30" y1="18" x2="172" y2="182" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1020" />
+      <stop offset="0.52" stop-color="#111827" />
+      <stop offset="1" stop-color="#030712" />
+    </linearGradient>
+    <linearGradient id="rim" x1="28" y1="28" x2="172" y2="172" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34D399" />
+      <stop offset="0.48" stop-color="#22D3EE" />
+      <stop offset="1" stop-color="#F59E0B" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(100 100) rotate(90) scale(74)">
+      <stop stop-color="#67E8F9" stop-opacity="0.45" />
+      <stop offset="0.42" stop-color="#14B8A6" stop-opacity="0.18" />
+      <stop offset="1" stop-color="#0F172A" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="agentLeft" x1="38" y1="72" x2="108" y2="132" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A7F3D0" />
+      <stop offset="0.55" stop-color="#34D399" />
+      <stop offset="1" stop-color="#0F766E" />
+    </linearGradient>
+    <linearGradient id="agentRight" x1="162" y1="72" x2="92" y2="132" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FDE68A" />
+      <stop offset="0.5" stop-color="#FB7185" />
+      <stop offset="1" stop-color="#7C3AED" />
+    </linearGradient>
+    <linearGradient id="innerStroke" x1="58" y1="56" x2="142" y2="144" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E2E8F0" stop-opacity="0.3" />
+      <stop offset="0.5" stop-color="#E2E8F0" stop-opacity="0.08" />
+      <stop offset="1" stop-color="#E2E8F0" stop-opacity="0.26" />
+    </linearGradient>
+    <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3.5" />
+    </filter>
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="6" result="blurred" />
+      <feColorMatrix in="blurred" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.8 0" />
+    </filter>
+    <clipPath id="hexClip">
+      <path d="M100 18L171 59V141L100 182L29 141V59L100 18Z" />
+    </clipPath>
+  </defs>
+
+  <path d="M100 18L171 59V141L100 182L29 141V59L100 18Z" fill="url(#shell)" stroke="url(#rim)" stroke-width="3.5" stroke-linejoin="round" />
+
+  <g clip-path="url(#hexClip)">
+    <rect width="200" height="200" fill="url(#glow)" />
+
+    <path d="M53 100C53 74.5 71.5 53.5 95.5 49.5C82.5 57.5 74 73 73.5 100C74 127 82.5 142.5 95.5 150.5C71.5 146.5 53 125.5 53 100Z" fill="#22D3EE" fill-opacity="0.06" />
+    <path d="M147 100C147 125.5 128.5 146.5 104.5 150.5C117.5 142.5 126 127 126.5 100C126 73 117.5 57.5 104.5 49.5C128.5 53.5 147 74.5 147 100Z" fill="#FB7185" fill-opacity="0.06" />
+
+    <g filter="url(#softGlow)">
+      <ellipse cx="100" cy="100" rx="33" ry="46" fill="none" stroke="#67E8F9" stroke-opacity="0.35" stroke-width="1.5" />
+      <ellipse cx="100" cy="100" rx="20" ry="28" fill="none" stroke="#F472B6" stroke-opacity="0.22" stroke-width="1.25" />
+    </g>
+
+    <path d="M42 100C52 78 72 65 93 68C83 78 77 88 77 100C77 112 83 122 93 132C72 135 52 122 42 100Z" fill="url(#agentLeft)" stroke="#E0F2FE" stroke-opacity="0.32" stroke-width="1.25" />
+    <path d="M158 100C148 122 128 135 107 132C117 122 123 112 123 100C123 88 117 78 107 68C128 65 148 78 158 100Z" fill="url(#agentRight)" stroke="#FFF7ED" stroke-opacity="0.3" stroke-width="1.25" />
+
+    <path d="M55 100C61 84 71 75 84 72C79 81 76 90 76 100C76 110 79 119 84 128C71 125 61 116 55 100Z" fill="#08111F" fill-opacity="0.45" />
+    <path d="M145 100C139 116 129 125 116 128C121 119 124 110 124 100C124 90 121 81 116 72C129 75 139 84 145 100Z" fill="#08111F" fill-opacity="0.45" />
+
+    <path d="M74 100C82 89 90 83 100 82C110 83 118 89 126 100C118 111 110 117 100 118C90 117 82 111 74 100Z" fill="#020617" fill-opacity="0.88" stroke="url(#innerStroke)" stroke-width="1.25" />
+
+    <path d="M100 59V81" stroke="#E2E8F0" stroke-opacity="0.18" stroke-width="1.2" stroke-linecap="round" />
+    <path d="M100 119V141" stroke="#E2E8F0" stroke-opacity="0.18" stroke-width="1.2" stroke-linecap="round" />
+    <path d="M59 100H81" stroke="#E2E8F0" stroke-opacity="0.18" stroke-width="1.2" stroke-linecap="round" />
+    <path d="M119 100H141" stroke="#E2E8F0" stroke-opacity="0.18" stroke-width="1.2" stroke-linecap="round" />
+
+    <path d="M71 74L91 92" stroke="#A7F3D0" stroke-opacity="0.5" stroke-width="1.35" stroke-linecap="round" />
+    <path d="M129 74L109 92" stroke="#FDE68A" stroke-opacity="0.48" stroke-width="1.35" stroke-linecap="round" />
+    <path d="M71 126L91 108" stroke="#67E8F9" stroke-opacity="0.55" stroke-width="1.35" stroke-linecap="round" />
+    <path d="M129 126L109 108" stroke="#FB7185" stroke-opacity="0.5" stroke-width="1.35" stroke-linecap="round" />
+
+    <circle cx="100" cy="100" r="9.5" fill="#E2E8F0" fill-opacity="0.12" stroke="#F8FAFC" stroke-opacity="0.35" stroke-width="1.25" />
+    <circle cx="100" cy="100" r="3" fill="#F8FAFC" fill-opacity="0.85" />
+
+    <g filter="url(#blur)">
+      <circle cx="59" cy="62" r="3.5" fill="#22D3EE" fill-opacity="0.36" />
+      <circle cx="141" cy="62" r="3.5" fill="#F59E0B" fill-opacity="0.34" />
+      <circle cx="59" cy="138" r="3.5" fill="#34D399" fill-opacity="0.36" />
+      <circle cx="141" cy="138" r="3.5" fill="#FB7185" fill-opacity="0.34" />
+    </g>
+  </g>
+
+  <path d="M100 18L171 59V141L100 182L29 141V59L100 18Z" fill="none" stroke="#F8FAFC" stroke-opacity="0.14" stroke-width="1" />
+</svg>
