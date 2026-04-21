@@ -169,6 +169,13 @@ defmodule AntiAgents.Progress do
     |> Map.update!(:llm_done, &(&1 + 1))
   end
 
+  defp apply_event(state, :baseline_call_rejected, metadata) do
+    state
+    |> finish_inflight({:baseline, metadata[:index]})
+    |> Map.update!(:baseline_done, &(&1 + 1))
+    |> Map.update!(:llm_done, &(&1 + 1))
+  end
+
   defp apply_event(state, :burst_call_done, metadata) do
     state
     |> finish_inflight({:burst, metadata[:index]})
@@ -249,6 +256,10 @@ defmodule AntiAgents.Progress do
 
   defp message(:baseline_call_error, metadata, snapshot, _opts) do
     "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} failed in #{duration(snapshot)} | reason=#{metadata[:reason]}"
+  end
+
+  defp message(:baseline_call_rejected, metadata, snapshot, opts) do
+    "LLM #{metadata[:llm_index]}/#{metadata[:llm_total]} baseline #{metadata[:index]}/#{metadata[:total]} #{metadata[:method]} rejected from reachable archive in #{duration(snapshot)} | reason=#{metadata[:reason]} | preview=#{inspect(preview(metadata[:output_preview], preview_limit(opts)))}"
   end
 
   defp message(:baseline_done, metadata, _snapshot, _opts) do
@@ -345,8 +356,7 @@ defmodule AntiAgents.Progress do
 
     inflight
     |> Map.values()
-    |> Enum.map(fn entry -> "#{entry.label} #{seconds(now - entry.started_at)}s" end)
-    |> Enum.join(", ")
+    |> Enum.map_join(", ", fn entry -> "#{entry.label} #{seconds(now - entry.started_at)}s" end)
   end
 
   defp preview_limit(opts), do: Keyword.get(opts, :preview_chars, @default_preview_chars)

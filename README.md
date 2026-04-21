@@ -186,6 +186,8 @@ the same cell are treated as semantically equivalent for frontier accounting.
 
 ```bash
 mix anti_agents.frontier "the memory of a color that doesn't exist" \
+  --verbose \
+  --heartbeat-ms 5000 \
   --branching 12 \
   --temperature 1.18 \
   --model gpt-5.4-mini \
@@ -197,6 +199,11 @@ mix anti_agents.frontier "the memory of a color that doesn't exist" \
 ```
 
 Add `--dry-run` to print the resolved run configuration without calling the model.
+Use `--verbose` for human-readable progress: the command prints the total LLM call
+plan, the current stage, `LLM n/total`, why each baseline/frontier call exists,
+heartbeats with in-flight work, and truncated input/output previews. Use
+`--preview-chars N` to tune preview length.
+
 The `--out` path receives a structured JSON trace (`AntiAgents.Trace`) that includes
 the synthesis claim under test, run parameters, evidence summary (`meaningful_signal`,
 `delta_frontier`, `mean_seed_coverage`), and per-exemplar mapping audit trails.
@@ -213,6 +220,7 @@ any burst where:
 When the backend returns unstructured plain text (no JSON), a synthetic mapping is
 deterministically derived from the answer text and the seed so that scoring and
 audit remain consistent. The `rejection_reason` field records this fallback explicitly.
+
 
 ## Credits
 

@@ -446,22 +446,41 @@ defmodule AntiAgents.Prompt do
     base = "Field: #{field.prompt}\n\n"
     seed = get_seed(opts)
 
+    plain_rule =
+      "\n\nReturn plain text only. Do not return JSON, XML tags, random_string, mapping, or prompt text."
+
     case method do
       :plain ->
-        "#{base}Return a concise, high-coherence answer to the field."
+        "#{base}Return a concise, high-coherence answer to the field.#{plain_rule}"
 
       :paraphrase ->
-        "#{base}Return a concise, faithful paraphrase of how you understand the field."
+        "#{base}Return a concise, faithful paraphrase of how you understand the field.#{plain_rule}"
 
       :seed_injection ->
-        "#{base}Use this seed internally to force a different but coherent framing: #{seed}"
+        "#{base}Use this seed internally to force a different but coherent framing: #{seed}. Do not print the seed.#{plain_rule}"
 
       {:temperature, temps} when is_list(temps) ->
-        "#{base}Return a concise, coherent answer. Suggested temperature: #{inspect(temps)}"
+        "#{base}Return a concise, coherent answer. Suggested temperature: #{inspect(temps)}.#{plain_rule}"
 
       _ ->
-        "#{base}Return a concise, coherent answer."
+        "#{base}Return a concise, coherent answer.#{plain_rule}"
     end
+  end
+
+  def baseline_input(field, method, opts) do
+    seed_line =
+      if method == :seed_injection do
+        "\nSeed: #{get_seed(opts)}"
+      else
+        ""
+      end
+
+    """
+    Field prompt: #{field.prompt}
+    Baseline method: #{baseline_method_name(method)}
+    Toward: #{render_list(field.toward)}
+    Away from: #{render_list(field.away_from)}#{seed_line}
+    """
   end
 
   def response_temperature(opts) do
@@ -547,6 +566,9 @@ defmodule AntiAgents.Prompt do
 
   defp render_list([]), do: "none"
   defp render_list(values), do: Enum.join(List.wrap(values), ", ")
+
+  defp baseline_method_name({:temperature, temp}), do: "temperature:#{temp}"
+  defp baseline_method_name(method), do: to_string(method)
 
   defp default_trace_id do
     "anti-agents-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -710,6 +732,26 @@ defmodule AntiAgents.Scoring do
   end
 
   def artifact_answer?(_answer), do: false
+
+  def clean_plain_answer(output) when is_binary(output) do
+    answer =
+      output
+      |> String.trim()
+      |> unwrap_answer_json()
+
+    cond do
+      answer == "" ->
+        {:error, :empty_answer}
+
+      artifact_answer?(answer) ->
+        {:error, :artifact_answer}
+
+      true ->
+        {:ok, answer}
+    end
+  end
+
+  def clean_plain_answer(_output), do: {:error, :invalid_answer}
 
   def duplicate?(_candidate, []), do: false
   def duplicate?(candidate, bursts), do: near_duplicate?(candidate.answer, bursts)
@@ -888,7 +930,19 @@ defmodule AntiAgents.Scoring do
   defp artifact_answer_text?(text) do
     String.contains?(text, "<random_string>") or
       String.contains?(text, "<mapping>") or
+      String.contains?(text, "Coordinate nonce:") or
+      String.contains?(text, "Field prompt:") or
       control_json_payload?(text)
+  end
+
+  defp unwrap_answer_json(text) do
+    case Jason.decode(text) do
+      {:ok, %{"answer" => answer} = decoded} when is_binary(answer) and map_size(decoded) == 1 ->
+        String.trim(answer)
+
+      _other ->
+        text
+    end
   end
 
   defp control_json_payload?(text) do
@@ -920,6 +974,19 @@ defmodule AntiAgents.Scoring do
     value
     |> Enum.map(&control_key_count/1)
     |> Enum.sum()
+  end
+
+  defp control_key_count(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if String.starts_with?(trimmed, ["{", "["]) do
+      case Jason.decode(trimmed) do
+        {:ok, decoded} -> control_key_count(decoded)
+        {:error, _reason} -> 0
+      end
+    else
+      0
+    end
   end
 
   defp control_key_count(_value), do: 0
@@ -1054,6 +1121,7 @@ defmodule AntiAgents.Bursts do
           index: Keyword.get(options, :burst_index),
           llm_index: progress_llm_index(options),
           llm_total: Keyword.get(options, :progress_llm_total),
+          total: Keyword.get(options, :burst_total),
           status: burst.status,
           seed_coverage: burst.seed_coverage,
           answer_length: String.length(burst.answer),
@@ -1067,6 +1135,7 @@ defmodule AntiAgents.Bursts do
           index: Keyword.get(options, :burst_index),
           llm_index: progress_llm_index(options),
           llm_total: Keyword.get(options, :progress_llm_total),
+          total: Keyword.get(options, :burst_total),
           reason: inspect(reason)
         })
 
@@ -1445,14 +1514,23 @@ defmodule AntiAgents.Frontier do
   end
 
   defp baseline_bursts(field, methods, opts, total_llm_calls) do
-    methods
-    |> Enum.flat_map(&expand_method/1)
-    |> then(fn expanded ->
-      expanded
-      |> Enum.with_index(1)
-      |> Enum.map(fn {method, index} ->
+    expanded = Enum.flat_map(methods, &expand_method/1)
+    concurrency = baseline_concurrency(opts, length(expanded))
+    timeout = Keyword.get(opts, :timeout_ms, 120_000)
+
+    expanded
+    |> Enum.with_index(1)
+    |> Task.async_stream(
+      fn {method, index} ->
         baseline_burst(field, method, opts, index, length(expanded), total_llm_calls)
-      end)
+      end,
+      max_concurrency: concurrency,
+      timeout: timeout,
+      ordered: true
+    )
+    |> Enum.map(fn
+      {:ok, burst} -> burst
+      {:exit, _reason} -> nil
     end)
     |> Enum.reject(&is_nil/1)
   end
@@ -1470,7 +1548,7 @@ defmodule AntiAgents.Frontier do
     client = Keyword.get(opts, :client, AntiAgents.CodexClient)
     method_opts = baseline_method_opts(method, opts)
     prompt = Prompt.baseline_prompt(field, method, method_opts)
-    input = Prompt.field_input(field, method_opts)
+    input = Prompt.baseline_input(field, method, method_opts)
 
     Progress.event(opts, :baseline_call_start, %{
       index: index,
@@ -1481,21 +1559,35 @@ defmodule AntiAgents.Frontier do
       input_preview: input
     })
 
-    case client.complete(prompt, completion_opts(field, prompt, input, method_opts)) do
+    case client.complete(prompt, baseline_completion_opts(prompt, input, method_opts)) do
       {:ok, raw} ->
-        burst = build_baseline_burst(field, method, raw)
+        case build_baseline_burst(field, method, raw) do
+          {:ok, burst} ->
+            Progress.event(opts, :baseline_call_done, %{
+              index: index,
+              llm_index: index,
+              llm_total: total_llm_calls,
+              method: method_label(method),
+              total: total,
+              answer_length: String.length(burst.answer),
+              output_preview: burst.answer
+            })
 
-        Progress.event(opts, :baseline_call_done, %{
-          index: index,
-          llm_index: index,
-          llm_total: total_llm_calls,
-          method: method_label(method),
-          total: total,
-          answer_length: String.length(burst.answer),
-          output_preview: burst.answer
-        })
+            burst
 
-        burst
+          {:error, reason, preview} ->
+            Progress.event(opts, :baseline_call_rejected, %{
+              index: index,
+              llm_index: index,
+              llm_total: total_llm_calls,
+              method: method_label(method),
+              total: total,
+              reason: inspect(reason),
+              output_preview: preview
+            })
+
+            nil
+        end
 
       {:error, reason} ->
         Progress.event(opts, :baseline_call_error, %{
@@ -1527,23 +1619,39 @@ defmodule AntiAgents.Frontier do
   defp baseline_method_opts(_method, opts), do: opts
 
   defp build_baseline_burst(field, method, raw) do
-    {:ok, answer} = Scoring.extract_text(raw)
-    answer = String.trim(answer)
+    with {:ok, text} <- Scoring.extract_text(raw),
+         {:ok, answer} <- Scoring.clean_plain_answer(text) do
+      {:ok,
+       %BurstResult{
+         field: field,
+         seed: "baseline",
+         random_string: "baseline",
+         mapping_trace: %{mode: :baseline, method: method},
+         answer: answer,
+         raw_output: answer,
+         status: :accepted,
+         rejection_reason: nil,
+         score: %{},
+         descriptor: Scoring.descriptor(answer, %{}, "", 1),
+         coherence: Scoring.coherence(answer),
+         seed_coverage: 0.0
+       }}
+    else
+      {:error, reason} ->
+        {:error, reason, raw |> inspect() |> String.slice(0, 500)}
+    end
+  end
 
-    %BurstResult{
-      field: field,
-      seed: "baseline",
-      random_string: "baseline",
-      mapping_trace: %{mode: :baseline, method: method},
-      answer: answer,
-      raw_output: answer,
-      status: :accepted,
-      rejection_reason: nil,
-      score: %{},
-      descriptor: Scoring.descriptor(answer, %{}, "", 1),
-      coherence: Scoring.coherence(answer),
-      seed_coverage: 0.0
-    }
+  defp baseline_concurrency(_opts, count) when count <= 1, do: 1
+
+  defp baseline_concurrency(opts, count) do
+    opts
+    |> Keyword.get(
+      :baseline_concurrency,
+      Keyword.get(opts, :concurrency, System.schedulers_online())
+    )
+    |> min(count)
+    |> max(1)
   end
 
   defp score_frontier(accepted, reachable) do
@@ -1553,7 +1661,7 @@ defmodule AntiAgents.Frontier do
     end)
   end
 
-  defp completion_opts(_field, prompt, input, opts) do
+  defp baseline_completion_opts(prompt, input, opts) do
     Keyword.merge(
       [
         input: input,
@@ -1563,10 +1671,9 @@ defmodule AntiAgents.Frontier do
         codex_opts: Keyword.get(opts, :codex_opts, []),
         thread_opts: Keyword.get(opts, :thread_opts, []),
         model_settings: Keyword.get(opts, :model_settings, Prompt.model_settings(opts)),
-        run_config: Prompt.run_config(opts),
+        run_config: Prompt.run_config(Keyword.put(opts, :group, "baseline")),
         turn_opts: turn_opts(opts),
-        agent: [instructions: prompt],
-        output_schema: Prompt.output_schema(opts)
+        agent: [instructions: prompt]
       ],
       Keyword.get(opts, :client_opts, [])
     )

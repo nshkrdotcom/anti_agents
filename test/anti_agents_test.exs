@@ -98,6 +98,69 @@ defmodule AntiAgentsTest do
     end
   end
 
+  defmodule PromptEchoClient do
+    def complete(_prompt, _opts) do
+      {:ok,
+       Jason.encode!(%{
+         "random_string" => "echo-seed",
+         "mapping" => %{
+           "decisions" => [
+             %{"axis" => "ontology", "chunk" => 0, "value" => "x"},
+             %{"axis" => "metaphor", "chunk" => 1, "value" => "y"},
+             %{"axis" => "closure", "chunk" => 2, "value" => "z"}
+           ]
+         },
+         "answer" => "Coordinate nonce: echo-seed Field prompt: leaked prompt text"
+       })}
+    end
+  end
+
+  defmodule ContractClient do
+    def complete(prompt, opts) do
+      send(opts[:test_pid], {:client_call, prompt, opts})
+
+      if String.contains?(prompt, "Produce exactly one exploration") do
+        {:ok,
+         Jason.encode!(%{
+           "random_string" => "contract-seed",
+           "mapping" => %{
+             "decisions" => [
+               %{"axis" => "ontology", "chunk" => 0, "value" => "x"},
+               %{"axis" => "metaphor", "chunk" => 1, "value" => "y"},
+               %{"axis" => "closure", "chunk" => 2, "value" => "z"}
+             ]
+           },
+           "answer" => "Frontier answer text."
+         })}
+      else
+        {:ok, "Plain reachable baseline answer."}
+      end
+    end
+  end
+
+  defmodule SlowBaselineClient do
+    def complete(prompt, opts) do
+      send(opts[:test_pid], {:slow_client_call, prompt, System.monotonic_time(:millisecond)})
+
+      if String.contains?(prompt, "Produce exactly one exploration") do
+        {:ok,
+         Jason.encode!(%{
+           "random_string" => "slow-seed",
+           "mapping" => %{
+             "decisions" => [
+               %{"axis" => "ontology", "chunk" => 0, "value" => "x"},
+               %{"axis" => "metaphor", "chunk" => 1, "value" => "y"}
+             ]
+           },
+           "answer" => "Frontier answer text."
+         })}
+      else
+        Process.sleep(120)
+        {:ok, "Slow baseline answer."}
+      end
+    end
+  end
+
   defmodule FrontierClient do
     def complete(prompt, _opts) do
       if String.contains?(prompt, "<random_string>") do
@@ -210,6 +273,21 @@ defmodule AntiAgentsTest do
       assert burst.status == :rejected
       assert burst.rejection_reason =~ "artifact answer"
     end
+
+    test "rejects prompt echoes instead of accepting them as answers" do
+      field = AntiAgents.field("prompt echo guard", axes: [:ontology, :metaphor, :closure])
+
+      burst =
+        Bursts.burst(field,
+          client: PromptEchoClient,
+          client_opts: [],
+          seed: "echo-seed",
+          coordinate: [length: 12, chunk: 4]
+        )
+
+      assert burst.status == :rejected
+      assert burst.rejection_reason =~ "artifact answer"
+    end
   end
 
   describe "codex sdk integration" do
@@ -302,6 +380,74 @@ defmodule AntiAgentsTest do
       assert is_list(compare.frontier_archive)
       assert is_number(compare.delta_frontier)
     end
+
+    test "baseline calls use a clean non-SSoT contract except explicit seed injection" do
+      field = AntiAgents.field("field for clean baselines")
+
+      AntiAgents.compare(field,
+        baseline: [:plain, :paraphrase, {:temperature, [1.0]}, :seed_injection],
+        branching: 1,
+        client: ContractClient,
+        client_opts: [test_pid: self()],
+        seed: "fixed-seed",
+        concurrency: 4,
+        heat: [answer: 1.0]
+      )
+
+      calls = collect_client_calls(5)
+
+      baseline_calls =
+        Enum.reject(calls, fn {prompt, _opts} ->
+          String.contains?(prompt, "Produce exactly one exploration")
+        end)
+
+      burst_calls =
+        Enum.filter(calls, fn {prompt, _opts} ->
+          String.contains?(prompt, "Produce exactly one exploration")
+        end)
+
+      assert length(baseline_calls) == 4
+      assert length(burst_calls) == 1
+
+      Enum.each(baseline_calls, fn {prompt, opts} ->
+        refute Keyword.has_key?(opts, :output_schema)
+        assert String.contains?(prompt, "Return plain text only")
+        refute String.contains?(opts[:input], "Coordinate nonce:")
+      end)
+
+      seed_injection =
+        Enum.find(baseline_calls, fn {_prompt, opts} ->
+          String.contains?(opts[:input], "Baseline method: seed_injection")
+        end)
+
+      assert {_prompt, seed_opts} = seed_injection
+      assert String.contains?(seed_opts[:input], "Seed: fixed-seed")
+    end
+
+    test "baseline calls are parallelized independently from frontier bursts" do
+      test_pid = self()
+      field = AntiAgents.field("parallel baselines")
+
+      AntiAgents.compare(field,
+        baseline: [:plain, :paraphrase, {:temperature, [1.0]}],
+        branching: 1,
+        client: SlowBaselineClient,
+        client_opts: [test_pid: test_pid],
+        concurrency: 3,
+        heat: [answer: 1.0]
+      )
+
+      baseline_starts =
+        4
+        |> collect_slow_client_calls()
+        |> Enum.reject(fn {prompt, _at} ->
+          String.contains?(prompt, "Produce exactly one exploration")
+        end)
+        |> Enum.map(fn {_prompt, at} -> at end)
+
+      assert length(baseline_starts) == 3
+      assert Enum.max(baseline_starts) - Enum.min(baseline_starts) < 80
+    end
   end
 
   describe "parse and score" do
@@ -379,6 +525,22 @@ defmodule AntiAgentsTest do
 
       assert Scoring.artifact_answer?(answer)
       refute Scoring.artifact_answer?(~s({"ordinary":"json","payload":true}))
+      assert Scoring.artifact_answer?("Coordinate nonce: abc Field prompt: leaked")
+    end
+
+    test "cleans answer-only JSON and rejects nested control JSON in plain answers" do
+      assert Scoring.clean_plain_answer(~s({"answer":"Plain text."})) == {:ok, "Plain text."}
+
+      nested =
+        Jason.encode!(%{
+          "answer" =>
+            Jason.encode!(%{
+              "random_string" => "abc",
+              "mapping" => %{"decisions" => []}
+            })
+        })
+
+      assert Scoring.clean_plain_answer(nested) == {:error, :artifact_answer}
     end
   end
 
@@ -519,6 +681,34 @@ defmodule AntiAgentsTest do
       assert trace["evidence"]["meaningful_signal"] == true
       assert hd(trace["exemplars"])["random_string"] == "abcdef123456"
       refute Map.has_key?(hd(trace["exemplars"]), "raw_output")
+    end
+  end
+
+  defp collect_client_calls(count), do: collect_client_calls(count, [])
+
+  defp collect_client_calls(0, acc), do: Enum.reverse(acc)
+
+  defp collect_client_calls(count, acc) do
+    receive do
+      {:client_call, prompt, opts} ->
+        collect_client_calls(count - 1, [{prompt, opts} | acc])
+    after
+      500 ->
+        flunk("expected #{count} more client calls")
+    end
+  end
+
+  defp collect_slow_client_calls(count), do: collect_slow_client_calls(count, [])
+
+  defp collect_slow_client_calls(0, acc), do: Enum.reverse(acc)
+
+  defp collect_slow_client_calls(count, acc) do
+    receive do
+      {:slow_client_call, prompt, at} ->
+        collect_slow_client_calls(count - 1, [{prompt, at} | acc])
+    after
+      1_000 ->
+        flunk("expected #{count} more slow client calls")
     end
   end
 end
